@@ -1,0 +1,8 @@
+{
+    "port": "COM16",
+    "baud": 115200,
+    "ptt_mode": "CI-V & RTS/DTR (Icom IC-7300)",
+    "our_id": "4351029",
+    "audio_in": 2,
+    "audio_out": 5
+}
