@@ -1,4 +1,4 @@
-﻿import math
+import math
 import struct
 import wave
 import io
@@ -343,7 +343,7 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Settings - CAT & Audio Configuration")
-        self.geometry("500x480")
+        self.geometry("520x500")
         self.parent = parent
         self.resizable(False, False)
 
@@ -361,7 +361,7 @@ class SettingsDialog(tk.Toplevel):
         self.entry_our_id.insert(0, str(self.parent.selected_our_id))
         self.entry_our_id.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
 
-        ser_frame = ttk.LabelFrame(self, text="Serial / Modem / CAT Interface", padding=10)
+        ser_frame = ttk.LabelFrame(self, text="Serial / Modem / Radio Interface", padding=10)
         ser_frame.pack(fill=tk.X, padx=10, pady=5)
 
         ttk.Label(ser_frame, text="COM Port:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
@@ -379,20 +379,22 @@ class SettingsDialog(tk.Toplevel):
         self.btn_toggle_conn.grid(row=0, column=3, padx=5, pady=5)
 
         ttk.Label(ser_frame, text="Baudrate:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.combo_baud = ttk.Combobox(ser_frame, values=["115200", "57600", "38400", "19200", "9600"], width=12, state="readonly")
+        self.combo_baud = ttk.Combobox(ser_frame, values=["115200", "57600", "38400", "19200", "9600", "4800"], width=12, state="readonly")
         self.combo_baud.set(str(self.parent.selected_baud))
         self.combo_baud.grid(row=1, column=1, padx=5, pady=5)
 
-        ttk.Label(ser_frame, text="PTT Mode:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(ser_frame, text="PTT Control:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
         self.combo_ptt_mode = ttk.Combobox(
             ser_frame,
             values=[
                 "CI-V & RTS/DTR (Icom IC-7300)",
-                "Pactor / Serial Modem (RTS)",
-                "Pactor / Serial Modem (DTR)",
-                "Pactor Host Command (PTT 1 / PTT 0)"
+                "Yaesu CAT (TX1; / TX0;)",
+                "Codan Envoy / NGT (CICS PTT ON/OFF)",
+                "Codan RTS/DTR Hardware PTT",
+                "Pactor Modem RTS/DTR",
+                "Pactor Modem Command (PTT 1 / PTT 0)"
             ],
-            width=28, state="readonly"
+            width=32, state="readonly"
         )
         self.combo_ptt_mode.set(self.parent.selected_ptt_mode)
         self.combo_ptt_mode.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=5, pady=5)
@@ -646,17 +648,41 @@ class SelCallApp(tk.Tk):
         if self.ser and self.ser.is_open:
             try:
                 mode = self.selected_ptt_mode
+
+                # 1. Icom CI-V & USB Lines
                 if mode == "CI-V & RTS/DTR (Icom IC-7300)":
                     self.ser.setRTS(active)
                     self.ser.setDTR(active)
                     sub_cmd = b'\x00\x01' if active else b'\x00\x00'
                     civ_frame = b'\xFE\xFE\x94\xE0\x1C' + sub_cmd + b'\xFD'
                     self.ser.write(civ_frame)
-                elif mode == "Pactor / Serial Modem (RTS)":
+
+                # 2. Yaesu CAT Standard (TX1; / TX0;)
+                elif mode == "Yaesu CAT (TX1; / TX0;)":
                     self.ser.setRTS(active)
-                elif mode == "Pactor / Serial Modem (DTR)":
                     self.ser.setDTR(active)
-                elif mode == "Pactor Host Command (PTT 1 / PTT 0)":
+                    cat_cmd = b"TX1;" if active else b"TX0;"
+                    self.ser.write(cat_cmd)
+
+                # 3. Codan Envoy / NGT (CICS Interface Command System)
+                elif mode == "Codan Envoy / NGT (CICS PTT ON/OFF)":
+                    self.ser.setRTS(active)
+                    cics_cmd = b"PTT ON\r\n" if active else b"PTT OFF\r\n"
+                    self.ser.write(cics_cmd)
+
+                # 4. Codan Hardware RTS/DTR Lines (RFU / Console)
+                elif mode == "Codan RTS/DTR Hardware PTT":
+                    self.ser.setRTS(active)
+                    self.ser.setDTR(active)
+
+                # 5. Pactor Modem über Hardware Pins
+                elif mode == "Pactor Modem RTS/DTR":
+                    self.ser.setRTS(active)
+                    self.ser.setDTR(active)
+
+                # 6. Pactor / Modem ASCII Command Mode
+                elif mode == "Pactor Modem Command (PTT 1 / PTT 0)":
+                    self.ser.setRTS(active)
                     cmd = b"PTT 1\r\n" if active else b"PTT 0\r\n"
                     self.ser.write(cmd)
 
@@ -881,21 +907,20 @@ class SelCallApp(tk.Tk):
 
         combined_audio = bytearray()
 
-        # 1. CODAN SelCall ID Vorspann (Call ID + Our ID)
+        # 1. CODAN SelCall ID Vorspann
         full_id_seq = call_id + our_id
         for char in full_id_seq:
             if char in CODAN_TONES:
                 freq = CODAN_TONES[char]
                 combined_audio.extend(self.audio_gen.generate_sine_wave(freq, 125))
 
-        # 2. Steuer-Schnittstelle / Trenner (Control Sync Tone 2100 Hz)
+        # 2. Control Sync Tone
         combined_audio.extend(self.audio_gen.generate_sine_wave(2100, 200))
         combined_audio.extend(self.audio_gen.generate_silence(50))
 
-        # 3. Audio-Codierung der Textnachricht (Pagecall AFSK Audio Töne)
+        # 3. Audio Text-Codierung
         for char in msg:
             val = ord(char)
-            # Frequenzen im CODAN Audio-Spektrum zwischen 1500 Hz und 2300 Hz
             f1 = 1500 + ((val & 0xF0) >> 4) * 45
             f2 = 1900 + (val & 0x0F) * 25
 
