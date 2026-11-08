@@ -2,7 +2,10 @@ import math
 import struct
 import wave
 import io
-import winsound
+try:
+    import winsound
+except ImportError:  # not on Windows
+    winsound = None
 import threading
 import time
 import json
@@ -216,11 +219,6 @@ TONE_STANDARDS = {
     }
 }
 
-CODAN_TONES = {
-    "0": 1700, "1": 1780, "2": 1860, "3": 1940, "4": 2020,
-    "5": 2100, "6": 2180, "7": 2260, "8": 2340, "9": 2420
-}
-
 NECODE_TONES = {
     "0": 600, "1": 741, "2": 882, "3": 1023, "4": 1164,
     "5": 1305, "6": 1446, "7": 1587, "8": 1728, "9": 1869
@@ -228,30 +226,59 @@ NECODE_TONES = {
 
 
 class AudioGenerator:
-    def __init__(self, sample_rate=44100):
+    def __init__(self, sample_rate=48000):
         self.sample_rate = sample_rate
+
+    @staticmethod
+    def _to_pcm(signal):
+        signal = np.clip(signal, -1.0, 1.0)
+        return bytearray((signal * 32767).astype('<i2').tobytes())
+
+    def _ramp(self, signal, ramp_ms=3):
+        n = min(int(self.sample_rate * ramp_ms / 1000.0), len(signal) // 2)
+        if n > 0:
+            ramp = np.linspace(0.0, 1.0, n)
+            signal[:n] *= ramp
+            signal[-n:] *= ramp[::-1]
+        return signal
 
     def generate_sine_wave(self, frequencies, duration_ms, amplitude=0.5):
         num_samples = int(self.sample_rate * (duration_ms / 1000.0))
-        samples = bytearray()
-
         if isinstance(frequencies, (int, float)):
             freqs = [frequencies]
         else:
-            freqs = frequencies
+            freqs = list(frequencies)
+        t = np.arange(num_samples) / self.sample_rate
+        val = np.zeros(num_samples)
+        for f in freqs:
+            if f > 0:
+                val += np.sin(2.0 * np.pi * f * t)
+        val = (val / max(len(freqs), 1)) * amplitude
+        return self._to_pcm(self._ramp(val))
 
-        for i in range(num_samples):
-            t = float(i) / self.sample_rate
-            val = 0.0
-            for f in freqs:
-                if f > 0:
-                    val += math.sin(2.0 * math.pi * f * t)
-            val = (val / len(freqs)) * amplitude
-            sample_val = int(val * 32767)
-            sample_val = max(-32768, min(32767, sample_val))
-            samples.extend(struct.pack('<h', sample_val))
+    def generate_tone_sequence(self, tones, amplitude=0.5):
+        """Phase-continuous sequence of single tones: list of (freq_hz, duration_ms)."""
+        freq_per_sample = []
+        for freq, dur in tones:
+            n = int(round(self.sample_rate * dur / 1000.0))
+            freq_per_sample.append(np.full(n, float(freq)))
+        if not freq_per_sample:
+            return bytearray()
+        f = np.concatenate(freq_per_sample)
+        phase = 2.0 * np.pi * np.cumsum(f) / self.sample_rate
+        signal = np.where(f > 0, np.sin(phase), 0.0) * amplitude
+        return self._to_pcm(self._ramp(signal, 5))
 
-        return samples
+    def generate_fsk(self, bits, baud, f_zero, f_one, amplitude=0.5):
+        """Phase-continuous 2-FSK (no clicks between bits)."""
+        bit_ms = 1000.0 / baud
+        # exact sample positions avoid timing drift over long preambles
+        bounds = np.round(np.arange(len(bits) + 1) * self.sample_rate / baud).astype(int)
+        f = np.empty(bounds[-1])
+        for i, b in enumerate(bits):
+            f[bounds[i]:bounds[i + 1]] = f_one if b else f_zero
+        phase = 2.0 * np.pi * np.cumsum(f) / self.sample_rate
+        return self._to_pcm(self._ramp(np.sin(phase) * amplitude, 5))
 
     def generate_silence(self, duration_ms):
         num_samples = int(self.sample_rate * (duration_ms / 1000.0))
@@ -265,6 +292,81 @@ class AudioGenerator:
             wav_file.setframerate(self.sample_rate)
             wav_file.writeframes(audio_data)
         return byte_io.getvalue()
+
+
+class CodanSelcallEncoder:
+    """CODAN HF selcall = CCIR 493-4 (4-digit addresses).
+
+    100 baud phase-continuous 2-FSK, 1700 Hz = bit 0, 1870 Hz = bit 1
+    (audio frequencies in USB). Each word = 7 information bits (LSB first)
+    followed by 3 check bits = number of zero bits in the information part
+    (MSB first). Every message word is sent twice (DX / RX, time diversity).
+    """
+    BAUD = 100
+    F_ZERO = 1700.0
+    F_ONE = 1870.0
+
+    FMT_SELCALL = 120       # selective call to individual station
+    FMT_CHANNEL_TEST = 123  # Codan channel test / beacon (radio answers with tones)
+    EOS_ARQ = 117           # end of sequence, acknowledge request
+    PHASING_DX = 125
+    PHASING_RX = [109, 108, 107, 106, 105, 104]
+
+    CATEGORIES = {
+        "Routine": 100,
+        "Business": 106,
+        "Safety": 108,
+        "Urgent": 110,
+        "Distress": 112,
+    }
+
+    @staticmethod
+    def word_bits(value):
+        value &= 0x7F
+        bits = [(value >> i) & 1 for i in range(7)]
+        zeros = bits.count(0)
+        bits += [(zeros >> 2) & 1, (zeros >> 1) & 1, zeros & 1]
+        return bits
+
+    @staticmethod
+    def split_id(station_id, label):
+        sid = str(station_id).strip()
+        if not (sid.isdigit() and len(sid) == 4):
+            raise ValueError(
+                f"{label} '{sid}' is invalid: CODAN / CCIR 493-4 selcall uses exactly 4 digits (0000-9999)."
+            )
+        return int(sid[:2]), int(sid[2:])
+
+    def build_words(self, call_id, our_id, fmt=FMT_SELCALL, category=100):
+        b1, b2 = self.split_id(call_id, "Call ID")
+        a1, a2 = self.split_id(our_id, "Our ID")
+        words = []
+        for rx in self.PHASING_RX:
+            words += [self.PHASING_DX, rx]
+        # DX/RX interleaved, RX copy lags DX copy by 4 words
+        words += [
+            fmt, fmt,
+            b1, fmt,
+            b2, fmt,
+            category, b1,
+            a1, b2,
+            a2, category,
+            self.EOS_ARQ, a1,
+            self.EOS_ARQ, a2,
+            self.EOS_ARQ, self.EOS_ARQ,
+        ]
+        return words
+
+    def build_bits(self, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0):
+        n_pre = max(20, int(round(preamble_s * self.BAUD)))
+        bits = [i & 1 for i in range(n_pre)]  # dot pattern 0101...
+        for w in self.build_words(call_id, our_id, fmt, category):
+            bits += self.word_bits(w)
+        return bits
+
+    def generate(self, audio_gen, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0):
+        bits = self.build_bits(call_id, our_id, fmt, category, preamble_s)
+        return audio_gen.generate_fsk(bits, self.BAUD, self.F_ZERO, self.F_ONE)
 
 
 class AudioDecoderEngine:
@@ -343,7 +445,7 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("Settings - CAT & Audio Configuration")
-        self.geometry("520x500")
+        self.geometry("560x540")
         self.parent = parent
         self.resizable(False, False)
 
@@ -398,6 +500,13 @@ class SettingsDialog(tk.Toplevel):
         )
         self.combo_ptt_mode.set(self.parent.selected_ptt_mode)
         self.combo_ptt_mode.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=5, pady=5)
+
+        ttk.Label(ser_frame, text="CI-V Address (hex):").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
+        self.entry_civ = ttk.Entry(ser_frame, width=6)
+        self.entry_civ.insert(0, self.parent.selected_civ_address)
+        self.entry_civ.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
+        ttk.Label(ser_frame, text="IC-7300 = 94, IC-7610 = 98, IC-705 = A4").grid(
+            row=3, column=2, columnspan=2, sticky=tk.W, padx=5, pady=5)
 
         audio_frame = ttk.LabelFrame(self, text="Audio Devices Configuration", padding=10)
         audio_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -476,10 +585,22 @@ class SettingsDialog(tk.Toplevel):
         out_name = self.combo_audio_out.get()
         our_id = self.entry_our_id.get().strip()
 
+        civ = self.entry_civ.get().strip().upper() or "94"
+        try:
+            int(civ, 16)
+        except ValueError:
+            messagebox.showerror("Error", "CI-V address must be hexadecimal, e.g. 94.")
+            return
+
+        port_changed = (port != self.parent.selected_port or baud != self.parent.selected_baud)
         self.parent.selected_port = port
         self.parent.selected_baud = baud
         self.parent.selected_ptt_mode = ptt_mode
         self.parent.selected_our_id = our_id
+        self.parent.selected_civ_address = civ
+
+        if port and (port_changed or not (self.parent.ser and self.parent.ser.is_open)):
+            self.parent.connect_serial(port, baud)
 
         if hasattr(self.parent, 'codan_our_id'):
             self.parent.codan_our_id.delete(0, tk.END)
@@ -501,8 +622,7 @@ class SelCallApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SelCall Terminal")
-        self.geometry("550x640")
-        self.audio_gen = AudioGenerator()
+        self.geometry("560x680")
         self.ser = None
 
         self.selected_port = ""
@@ -511,15 +631,26 @@ class SelCallApp(tk.Tk):
         self.selected_our_id = "5678"
         self.selected_audio_in = None
         self.selected_audio_out = None
+        self.selected_audio_in_name = ""
+        self.selected_audio_out_name = ""
+        self.selected_codan_preamble = 2.0
+        self.selected_civ_address = "94"
 
         self.load_config_file()
+        self.resolve_audio_devices()
 
+        self.audio_gen = AudioGenerator()
+        self.codan_encoder = CodanSelcallEncoder()
+        self.tx_lock = threading.Lock()
         self.decoder_engine = AudioDecoderEngine(self.on_decoder_event)
 
         self.create_menu()
         self.create_rx_panel()
         self.create_tabs()
         self.create_footer()
+
+        if self.selected_port:
+            self.after(300, lambda: self.connect_serial(self.selected_port, self.selected_baud, quiet=True))
 
     def load_config_file(self):
         if os.path.exists(SETTINGS_FILE):
@@ -532,8 +663,40 @@ class SelCallApp(tk.Tk):
                     self.selected_our_id = cfg.get("our_id", "5678")
                     self.selected_audio_in = cfg.get("audio_in", None)
                     self.selected_audio_out = cfg.get("audio_out", None)
+                    self.selected_audio_in_name = cfg.get("audio_in_name", "")
+                    self.selected_audio_out_name = cfg.get("audio_out_name", "")
+                    self.selected_codan_preamble = float(cfg.get("codan_preamble", 2.0))
+                    self.selected_civ_address = str(cfg.get("civ_address", "94"))
             except Exception as e:
                 print(f"Error loading settings.json: {e}")
+
+    @staticmethod
+    def device_name(index):
+        if index is None:
+            return ""
+        try:
+            return sd.query_devices(index)['name']
+        except Exception:
+            return ""
+
+    def resolve_audio_devices(self):
+        """Device indices change when USB devices are re-plugged: prefer the saved name."""
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return
+        for attr, kind in (("selected_audio_in", "max_input_channels"),
+                           ("selected_audio_out", "max_output_channels")):
+            name = getattr(self, attr + "_name")
+            if not name:
+                continue
+            idx = getattr(self, attr)
+            if idx is not None and 0 <= idx < len(devices) and devices[idx]['name'] == name:
+                continue
+            for i, dev in enumerate(devices):
+                if dev['name'] == name and dev[kind] > 0:
+                    setattr(self, attr, i)
+                    break
 
     def save_config_file(self):
         cfg = {
@@ -542,7 +705,11 @@ class SelCallApp(tk.Tk):
             "ptt_mode": self.selected_ptt_mode,
             "our_id": self.selected_our_id,
             "audio_in": self.selected_audio_in,
-            "audio_out": self.selected_audio_out
+            "audio_out": self.selected_audio_out,
+            "audio_in_name": self.device_name(self.selected_audio_in),
+            "audio_out_name": self.device_name(self.selected_audio_out),
+            "codan_preamble": self.selected_codan_preamble,
+            "civ_address": self.selected_civ_address
         }
         try:
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -582,6 +749,15 @@ class SelCallApp(tk.Tk):
 
         self.txt_rx_log = tk.Text(rx_frame, height=4, width=55, state="disabled")
         self.txt_rx_log.grid(row=2, column=0, columnspan=4, padx=5, pady=5)
+
+    def log(self, text):
+        def _do():
+            timestamp = time.strftime("%H:%M:%S")
+            self.txt_rx_log.config(state="normal")
+            self.txt_rx_log.insert(tk.END, f"[{timestamp}] {text}\n")
+            self.txt_rx_log.see(tk.END)
+            self.txt_rx_log.config(state="disabled")
+        self.after(0, _do)
 
     def clear_rx_log(self):
         self.entry_rx_seq.delete(0, tk.END)
@@ -629,87 +805,134 @@ class SelCallApp(tk.Tk):
     def open_settings(self):
         SettingsDialog(self)
 
-    def connect_serial(self, port, baud):
+    def connect_serial(self, port, baud, quiet=False):
         if self.ser and self.ser.is_open:
             self.ser.close()
         try:
-            self.ser = serial.Serial(port, baud, timeout=0.1)
+            ser = serial.Serial()
+            ser.port = port
+            ser.baudrate = baud
+            ser.timeout = 0.1
+            ser.write_timeout = 1
+            # pyserial raises DTR/RTS on open by default -> radio could key up
+            ser.dtr = False
+            ser.rts = False
+            ser.open()
+            self.ser = ser
+            self.log(f"Serial {port} @ {baud} connected ({self.selected_ptt_mode})")
             return True
         except Exception as e:
-            messagebox.showerror("Serial Error", f"Could not open {port}: {e}")
+            self.ser = None
+            self.log(f"Serial {port} could not be opened: {e}")
+            if not quiet:
+                messagebox.showerror("Serial Error", f"Could not open {port}: {e}")
             return False
 
     def disconnect_serial(self):
         if self.ser and self.ser.is_open:
-            self.ser.close()
-            self.ser = None
-
-    def set_ptt(self, active: bool):
-        if self.ser and self.ser.is_open:
             try:
-                mode = self.selected_ptt_mode
+                self.ser.dtr = False
+                self.ser.rts = False
+            except Exception:
+                pass
+            self.ser.close()
+        self.ser = None
 
-                # 1. Icom CI-V & USB Lines
-                if mode == "CI-V & RTS/DTR (Icom IC-7300)":
-                    self.ser.setRTS(active)
-                    self.ser.setDTR(active)
-                    sub_cmd = b'\x00\x01' if active else b'\x00\x00'
-                    civ_frame = b'\xFE\xFE\x94\xE0\x1C' + sub_cmd + b'\xFD'
-                    self.ser.write(civ_frame)
+    def ensure_serial(self):
+        if self.ser and self.ser.is_open:
+            return True
+        if self.selected_port:
+            return self.connect_serial(self.selected_port, self.selected_baud, quiet=True)
+        return False
 
-                # 2. Yaesu CAT Standard (TX1; / TX0;)
-                elif mode == "Yaesu CAT (TX1; / TX0;)":
-                    self.ser.setRTS(active)
-                    self.ser.setDTR(active)
-                    cat_cmd = b"TX1;" if active else b"TX0;"
-                    self.ser.write(cat_cmd)
+    def civ_frame(self, payload: bytes) -> bytes:
+        try:
+            addr = int(self.selected_civ_address, 16) & 0xFF
+        except ValueError:
+            addr = 0x94
+        return b'\xFE\xFE' + bytes([addr, 0xE0]) + payload + b'\xFD'
 
-                # 3. Codan Envoy / NGT (CICS Interface Command System)
-                elif mode == "Codan Envoy / NGT (CICS PTT ON/OFF)":
-                    self.ser.setRTS(active)
-                    cics_cmd = b"PTT ON\r\n" if active else b"PTT OFF\r\n"
-                    self.ser.write(cics_cmd)
+    def set_ptt(self, active: bool) -> bool:
+        if not (self.ser and self.ser.is_open):
+            return False
+        try:
+            mode = self.selected_ptt_mode
 
-                # 4. Codan Hardware RTS/DTR Lines (RFU / Console)
-                elif mode == "Codan RTS/DTR Hardware PTT":
-                    self.ser.setRTS(active)
-                    self.ser.setDTR(active)
+            # 1. Icom CI-V (cmd 1C 00: 01 = TX, 00 = RX) + USB SEND via RTS/DTR
+            if mode == "CI-V & RTS/DTR (Icom IC-7300)":
+                self.ser.write(self.civ_frame(b'\x1C\x00' + (b'\x01' if active else b'\x00')))
+                self.ser.rts = active
+                self.ser.dtr = active
 
-                # 5. Pactor Modem über Hardware Pins
-                elif mode == "Pactor Modem RTS/DTR":
-                    self.ser.setRTS(active)
-                    self.ser.setDTR(active)
+            # 2. Yaesu CAT Standard (TX1; / TX0;)
+            elif mode == "Yaesu CAT (TX1; / TX0;)":
+                self.ser.write(b"TX1;" if active else b"TX0;")
+                self.ser.rts = active
+                self.ser.dtr = active
 
-                # 6. Pactor / Modem ASCII Command Mode
-                elif mode == "Pactor Modem Command (PTT 1 / PTT 0)":
-                    self.ser.setRTS(active)
-                    cmd = b"PTT 1\r\n" if active else b"PTT 0\r\n"
-                    self.ser.write(cmd)
+            # 3. Codan Envoy / NGT (CICS Interface Command System)
+            elif mode == "Codan Envoy / NGT (CICS PTT ON/OFF)":
+                self.ser.write(b"PTT ON\r\n" if active else b"PTT OFF\r\n")
+                self.ser.rts = active
 
-                self.ser.flush()
-            except Exception as e:
-                print(f"PTT Exception: {e}")
+            # 4./5. Hardware RTS/DTR keying (Codan RFU/console, Pactor modem, interfaces)
+            elif mode in ("Codan RTS/DTR Hardware PTT", "Pactor Modem RTS/DTR"):
+                self.ser.rts = active
+                self.ser.dtr = active
+
+            # 6. Pactor / Modem ASCII Command Mode
+            elif mode == "Pactor Modem Command (PTT 1 / PTT 0)":
+                self.ser.write(b"PTT 1\r\n" if active else b"PTT 0\r\n")
+                self.ser.rts = active
+
+            self.ser.flush()
+            return True
+        except Exception as e:
+            self.log(f"PTT error: {e}")
+            return False
 
     def play_audio_with_ptt(self, wav_bytes):
+        if not self.tx_lock.acquire(blocking=False):
+            self.log("TX busy - wait until the current transmission is finished")
+            return
+
+        if not self.ensure_serial():
+            self.log("WARNING: no serial/CAT connection - PTT is NOT keyed (audio only)")
+        if self.selected_audio_out is None:
+            self.log("WARNING: no TX audio device selected - using Windows default output")
+
+        rx_was_running = self.decoder_engine.is_running
+
         def _play():
-            self.set_ptt(True)
-            time.sleep(0.15)
+            try:
+                if rx_was_running:
+                    self.decoder_engine.stop()
+                keyed = self.set_ptt(True)
+                if keyed:
+                    self.log("PTT ON")
+                time.sleep(0.3)  # let the transmitter / ALC settle
 
-            if self.selected_audio_out is not None:
+                wav_io = io.BytesIO(wav_bytes)
+                with wave.open(wav_io, 'rb') as wf:
+                    data = wf.readframes(wf.getnframes())
+                    rate = wf.getframerate()
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                 try:
-                    wav_io = io.BytesIO(wav_bytes)
-                    with wave.open(wav_io, 'rb') as wf:
-                        data = wf.readframes(wf.getnframes())
-                        samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-                        sd.play(samples, samplerate=wf.getframerate(), device=self.selected_audio_out)
-                        sd.wait()
-                except Exception:
-                    winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
-            else:
-                winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
+                    sd.play(samples, samplerate=rate, device=self.selected_audio_out, blocking=True)
+                except Exception as e:
+                    self.log(f"Audio output error ({e}) - falling back to default device")
+                    if winsound is not None:
+                        winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
+                    else:
+                        sd.play(samples, samplerate=rate, blocking=True)
 
-            time.sleep(0.1)
-            self.set_ptt(False)
+                time.sleep(0.15)
+            finally:
+                if self.set_ptt(False):
+                    self.log("PTT OFF")
+                if rx_was_running:
+                    self.after(0, lambda: self.decoder_engine.start(self.selected_audio_in))
+                self.tx_lock.release()
 
         threading.Thread(target=_play, daemon=True).start()
 
@@ -828,17 +1051,19 @@ class SelCallApp(tk.Tk):
                 freqs = mode_cfg["tones"][seq]
                 combined_audio.extend(self.audio_gen.generate_sine_wave(freqs, dur))
         else:
+            tones = []
             for char in seq:
+                if char not in mode_cfg["tones"]:
+                    continue
                 target_char = char
+                # repeated digit -> repeat tone (R), e.g. 1 1 1 -> 1 R 1
                 if char == prev_key and "R" in mode_cfg["tones"]:
                     target_char = "R"
-
-                if target_char in mode_cfg["tones"]:
-                    freqs = mode_cfg["tones"][target_char]
-                    combined_audio.extend(self.audio_gen.generate_sine_wave(freqs, dur))
-                    if gap > 0:
-                        combined_audio.extend(self.audio_gen.generate_silence(gap))
-                    prev_key = char
+                tones.append((mode_cfg["tones"][target_char], dur))
+                if gap > 0:
+                    tones.append((0, gap))
+                prev_key = target_char
+            combined_audio.extend(self.audio_gen.generate_tone_sequence(tones))
 
         if combined_audio:
             wav_bytes = self.audio_gen.create_wav_bytes(combined_audio)
@@ -849,104 +1074,69 @@ class SelCallApp(tk.Tk):
         btn_frame.pack(fill=tk.X)
 
         self.codan_priority = tk.StringVar(value="Routine")
-        priorities = ["Routine", "Business", "Safety", "Urgent", "Distress"]
-
-        for p in priorities:
+        for p in CodanSelcallEncoder.CATEGORIES:
             btn = ttk.Radiobutton(btn_frame, text=p, value=p, variable=self.codan_priority, style="Toolbutton")
             btn.pack(side=tk.LEFT, padx=2)
 
         form_frame = ttk.Frame(self.tab_codan, padding=10)
         form_frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(form_frame, text="Call ID:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Label(form_frame, text="Call ID (4 digits):").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.codan_call_id = ttk.Entry(form_frame, width=15)
         self.codan_call_id.insert(0, "1234")
         self.codan_call_id.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
 
-        ttk.Label(form_frame, text="Our ID:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(form_frame, text="Our ID (4 digits):").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.codan_our_id = ttk.Entry(form_frame, width=15)
         self.codan_our_id.insert(0, str(self.selected_our_id))
         self.codan_our_id.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
 
-        ttk.Label(form_frame, text="Message:").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.codan_msg_entry = ttk.Entry(form_frame, width=30)
-        self.codan_msg_entry.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
-
-        btn_send_msg = ttk.Button(form_frame, text="Send Text Msg", command=self.send_codan_text_message)
-        btn_send_msg.grid(row=2, column=2, padx=5, pady=5)
+        ttk.Label(form_frame, text="Preamble (s):").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.codan_preamble = ttk.Spinbox(form_frame, from_=0.5, to=30, increment=0.5, width=6)
+        self.codan_preamble.set(str(self.selected_codan_preamble))
+        self.codan_preamble.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(form_frame, text="2 s = radio on channel, 6-12 s = radio scanning").grid(
+            row=2, column=2, sticky=tk.W, pady=5)
 
         btn_send = ttk.Button(form_frame, text="Send SelCall", command=self.send_codan)
         btn_send.grid(row=3, column=1, sticky=tk.W, padx=10, pady=15)
 
-        btn_status = ttk.Button(form_frame, text="Get Status", command=self.send_codan_status)
-        btn_status.grid(row=3, column=2, padx=5, pady=15)
+        btn_test = ttk.Button(form_frame, text="Channel Test", command=self.send_codan_channel_test)
+        btn_test.grid(row=3, column=2, sticky=tk.W, padx=5, pady=15)
 
-    def send_codan_status(self):
+        ttk.Label(
+            form_frame,
+            text="CCIR 493-4 / CODAN: 100 Bd FSK 1700/1870 Hz. Radio in USB (IC-7300: USB-D).",
+            foreground="gray"
+        ).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=5)
+
+    def _codan_preamble_seconds(self):
+        try:
+            return max(0.2, float(self.codan_preamble.get().replace(",", ".")))
+        except ValueError:
+            return 2.0
+
+    def _send_codan_frame(self, fmt):
         call_id = self.codan_call_id.get().strip()
         our_id = self.codan_our_id.get().strip()
-
-        full_seq = call_id + our_id + "99"
-        combined_audio = bytearray()
-
-        for char in full_seq:
-            if char in CODAN_TONES:
-                freq = CODAN_TONES[char]
-                combined_audio.extend(self.audio_gen.generate_sine_wave(freq, 125))
-
-        if combined_audio:
-            wav_bytes = self.audio_gen.create_wav_bytes(combined_audio)
-            self.play_audio_with_ptt(wav_bytes)
-
-    def send_codan_text_message(self):
-        msg = self.codan_msg_entry.get().strip().upper()
-        call_id = self.codan_call_id.get().strip()
-        our_id = self.codan_our_id.get().strip()
-
-        if not msg:
+        category = CodanSelcallEncoder.CATEGORIES.get(self.codan_priority.get(), 100)
+        preamble = self._codan_preamble_seconds()
+        try:
+            audio = self.codan_encoder.generate(
+                self.audio_gen, call_id, our_id, fmt=fmt, category=category, preamble_s=preamble)
+        except ValueError as e:
+            messagebox.showerror("CODAN SelCall", str(e))
             return
-
-        combined_audio = bytearray()
-
-        # 1. CODAN SelCall ID Vorspann
-        full_id_seq = call_id + our_id
-        for char in full_id_seq:
-            if char in CODAN_TONES:
-                freq = CODAN_TONES[char]
-                combined_audio.extend(self.audio_gen.generate_sine_wave(freq, 125))
-
-        # 2. Control Sync Tone
-        combined_audio.extend(self.audio_gen.generate_sine_wave(2100, 200))
-        combined_audio.extend(self.audio_gen.generate_silence(50))
-
-        # 3. Audio Text-Codierung
-        for char in msg:
-            val = ord(char)
-            f1 = 1500 + ((val & 0xF0) >> 4) * 45
-            f2 = 1900 + (val & 0x0F) * 25
-
-            combined_audio.extend(self.audio_gen.generate_sine_wave([f1, f2], 80))
-            combined_audio.extend(self.audio_gen.generate_silence(20))
-
-        if combined_audio:
-            wav_bytes = self.audio_gen.create_wav_bytes(combined_audio)
-            self.play_audio_with_ptt(wav_bytes)
-            self.codan_msg_entry.delete(0, tk.END)
+        self.selected_codan_preamble = preamble
+        self.log(f"TX CODAN {'Selcall' if fmt == CodanSelcallEncoder.FMT_SELCALL else 'Channel Test'} "
+                 f"{our_id} -> {call_id} ({self.codan_priority.get()}, preamble {preamble:.1f} s)")
+        self.play_audio_with_ptt(self.audio_gen.create_wav_bytes(audio))
 
     def send_codan(self):
-        call_id = self.codan_call_id.get().strip()
-        our_id = self.codan_our_id.get().strip()
+        self._send_codan_frame(CodanSelcallEncoder.FMT_SELCALL)
 
-        full_seq = call_id + our_id
-        combined_audio = bytearray()
-
-        for char in full_seq:
-            if char in CODAN_TONES:
-                freq = CODAN_TONES[char]
-                combined_audio.extend(self.audio_gen.generate_sine_wave(freq, 125))
-
-        if combined_audio:
-            wav_bytes = self.audio_gen.create_wav_bytes(combined_audio)
-            self.play_audio_with_ptt(wav_bytes)
+    def send_codan_channel_test(self):
+        self._send_codan_frame(CodanSelcallEncoder.FMT_CHANNEL_TEST)
 
     def build_necode_tab(self):
         form_frame = ttk.Frame(self.tab_necode, padding=20)
