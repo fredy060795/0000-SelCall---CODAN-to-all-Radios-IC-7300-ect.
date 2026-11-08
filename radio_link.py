@@ -433,6 +433,51 @@ class RadioLink:
             return f"CAT-Protokoll {self.cat_protocol} hat keinen PTT-Befehl – RTS oder DTR wählen"
         return ""
 
+    # ------------------------------------------------------- Icom extras
+    def icom_query(self, payload: bytes, reply_len: int, timeout: float = 0.6) -> Optional[bytes]:
+        """Send FE FE <radio> E0 <payload> FD, return the data bytes of the answer."""
+        if not self.rig.is_open:
+            return None
+        addr = self._civ_address()
+        head = f"E0 {addr:02X} " + " ".join(f"{b:02X}" for b in payload)
+        self.rig.clear_recent()
+        self.rig.write(b"\xFE\xFE" + bytes([addr, 0xE0]) + payload + b"\xFD")
+        line = self.rig.wait_for(lambda t: head in t and "FD" in t[t.find(head):], timeout)
+        if line is None:
+            return None
+        rest = line[line.find(head) + len(head):].split()
+        data = []
+        for item in rest:
+            if item == "FD":
+                break
+            data.append(int(item, 16))
+        return bytes(data[:reply_len]) if len(data) >= reply_len else None
+
+    def icom_meter(self, which: str) -> Optional[int]:
+        """Po or ALC meter 0..255 (CI-V 15 11 / 15 13), None if not readable."""
+        sub = {"PO": 0x11, "ALC": 0x13, "SWR": 0x12}[which.upper()]
+        data = self.icom_query(bytes([0x15, sub]), 2, timeout=0.4)
+        if data is None:
+            return None
+        try:
+            return int(f"{data[0]:02X}{data[1]:02X}")      # BCD 0000..0255
+        except ValueError:
+            return None
+
+    def icom_set_usb_data(self) -> str:
+        """Mode USB + DATA on (USB-D), as needed for audio from the USB sound card."""
+        if not self.rig.is_open:
+            return "RIG COM Port ist nicht verbunden"
+        addr = self._civ_address()
+        replies = []
+        for payload in (b"\x06\x01\x01", b"\x1A\x06\x01\x01"):      # mode USB, data mode on (FIL1)
+            self.rig.clear_recent()
+            self.rig.write(b"\xFE\xFE" + bytes([addr, 0xE0]) + payload + b"\xFD")
+            reply = self.rig.wait_for(lambda t: f"E0 {addr:02X} FB FD" in t or f"E0 {addr:02X} FA FD" in t, 0.6)
+            replies.append("OK" if reply and "FB" in reply else ("abgelehnt" if reply else "keine Antwort"))
+        self.log(f"Funkgerät auf USB-D: Mode USB {replies[0]}, DATA {replies[1]}")
+        return "" if replies == ["OK", "OK"] else f"Mode USB {replies[0]}, DATA {replies[1]}"
+
     def _icom_ptt(self, active: bool, frame: bytes) -> bool:
         """CI-V PTT with the radio's answer: FB = done, FA = refused, nothing = no link."""
         addr = f"{self._civ_address():02X}"

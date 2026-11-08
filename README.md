@@ -148,8 +148,25 @@ WENN DIE PTT NICHT AUF SENDEN GEHT (IC-7300, PTT Methode CAT)
                             IC-7300: MENU > SET > Connectors > CI-V >
                             CI-V USB Baud Rate = 115200, CI-V Address = 94h.
 
-SOUNDKARTE WIRD NICHT ERKANNT
------------------------------
+SOUNDKARTE WIRD NICHT ERKANNT / TON KOMMT AM PC HERAUS
+------------------------------------------------------
+Das Programm spielt NIE mehr auf dem Windows-Standardgerät (PC-Lautsprecher):
+fehlt die Funkgeräte-Soundkarte, wird nicht gesendet und die Suche angeboten.
+"Microsoft Sound Mapper" / "Primärer Soundtreiber" stehen nicht mehr in der
+Liste - das ist immer der PC-Lautsprecher.
+
+Sicherster Weg (Icom, PTT Methode CAT):
+  Einstellungen → Audio → "🎯 Per Sendetest finden (Icom)"
+  Das Funkgerät geht nacheinander je 1 s auf Senden, auf jeder Soundkarte
+  wird ein Ton gespielt und über CI-V die Leistung/ALC gelesen. Die Karte,
+  bei der Leistung herauskommt, ist die des Funkgeräts - sie wird
+  gespeichert (Eingang passend dazu). Vorher stellt das Programm das
+  Funkgerät auf USB-D. Kommt bei keiner Karte Leistung: am IC-7300
+  DATA MOD = USB und USB MOD Level prüfen.
+Bei jedem Senden liest das Programm Leistung/ALC und warnt, wenn kein Ton
+am Funkgerät ankommt.
+"Ton ohne PTT abspielen": hörst du den Ton am PC, ist es die falsche Karte.
+
 - Ist die Liste leer: "py -m pip install sounddevice" fehlt.
 - IC-7300 per USB anschließen und EINSCHALTEN, bevor das Programm startet
   (sonst gibt es den "USB Audio CODEC" nicht). Treiber: Icom USB Driver.
