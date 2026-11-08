@@ -175,6 +175,12 @@ am Funkgerät ankommt.
 
 IC-7300 MIT PACTOR-MODEM AN ACC
 -------------------------------
+Hängt das Modem auch am CI-V REMOTE-Anschluss des IC-7300:
+  MENU > SET > Connectors > CI-V > CI-V USB Port = Unlink from [REMOTE]
+Sonst gilt am USB-Port die REMOTE-Baudrate (z.B. 19200) und Modem und PC
+stören sich auf dem CI-V-Bus. Antwortet das Funkgerät nicht, probiert
+SelCall beim Verbinden alle Baudraten durch und übernimmt die richtige.
+
 Der IC-7300 hat ZWEI Ton-Einstellungen:
   DATA MOD      gilt für USB-D  -> ACC lassen (PACTOR-Modem)
   DATA OFF MOD  gilt für USB    -> einmalig auf MIC,USB stellen

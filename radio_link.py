@@ -294,6 +294,10 @@ class RadioLink:
             try:
                 self.rig.open(rig_port, int(self.cfg.get("RIG_BAUD", 9600)))
                 self.log(f"RIG {rig_port} @ {self.rig.baud} geöffnet ({self.cat_protocol}, PTT {self.ptt_method})")
+                if self.cat_protocol.upper() == "ICOM" and self.ptt_method == "CAT":
+                    problem = self._icom_find_baud(rig_port)
+                    if problem:
+                        problems.append(problem)
             except Exception as exc:
                 problems.append(f"RIG {rig_port}: {exc}")
         elif need_rig:
@@ -303,12 +307,58 @@ class RadioLink:
             try:
                 self.ptc.open(ptc_port, int(self.cfg.get("PTC_BAUD", 57600)))
                 self.log(f"PTC {ptc_port} @ {self.ptc.baud} geöffnet")
-                self._ensure_ptc_terminal_mode()
+                if not self._ensure_ptc_terminal_mode():
+                    self._ptc_find_baud(ptc_port)
             except Exception as exc:
                 problems.append(f"PTC {ptc_port}: {exc}")
         elif need_ptc:
             problems.append("Kein PTC COM Port eingestellt (PTT Methode TNC braucht das Modem)")
         return problems
+
+    # ------------------------------------------------- find the baud rate
+    ICOM_BAUDS = (115200, 19200, 9600, 38400, 57600, 4800)
+    cfg_changed = False
+
+    def icom_alive(self) -> bool:
+        """The Icom answers a 'read frequency' (03) on CI-V."""
+        return self.icom_query(b"\x03", 5, timeout=0.5) is not None
+
+    def _icom_find_baud(self, port: str) -> str:
+        """Icom does not answer at the set baud rate: try the others and keep the one that works."""
+        if self.icom_alive():
+            return ""
+        first = self.rig.baud
+        self.log(f"IC-7300 antwortet nicht mit {first} Bd – probiere andere Baudraten …")
+        for baud in self.ICOM_BAUDS:
+            if baud == first:
+                continue
+            self.rig.open(port, baud)
+            if self.icom_alive():
+                self.cfg["RIG_BAUD"] = baud
+                self.cfg_changed = True
+                self.log(f"IC-7300 antwortet mit {baud} Bd – übernommen. (Steht am Funkgerät 'CI-V USB Port' "
+                         f"auf 'Link to [REMOTE]', gilt die REMOTE-Baudrate. Besser: MENU > SET > Connectors > "
+                         f"CI-V > CI-V USB Port = Unlink from [REMOTE].)")
+                return ""
+        self.rig.open(port, first)
+        return (f"Das Funkgerät antwortet auf {port} mit keiner Baudrate (CI-V {self._civ_address():02X}h). "
+                f"Prüfen am IC-7300: MENU > SET > Connectors > CI-V: CI-V Address 94h, "
+                f"CI-V USB Port = Unlink from [REMOTE], CI-V USB Baud Rate 115200. "
+                f"Läuft HFChat/ein anderes CAT-Programm noch?")
+
+    def _ptc_find_baud(self, port: str):
+        first = self.ptc.baud
+        for baud in (57600, 115200, 38400, 19200, 9600):
+            if baud == first:
+                continue
+            self.ptc.open(port, baud)
+            if self._ensure_ptc_terminal_mode():
+                self.cfg["PTC_BAUD"] = baud
+                self.cfg_changed = True
+                self.log(f"Modem antwortet mit {baud} Bd – übernommen")
+                return
+        self.ptc.open(port, first)
+        self.log("Modem antwortet mit keiner Baudrate – eingeschaltet? HFChat beendet?")
 
     def disconnect(self):
         self.usb_data_set = False
@@ -559,6 +609,11 @@ class RadioLink:
             state["mode"] = mode
         if data is not None:
             state["data"] = data
+        if mode is None and data is None and not self.icom_alive():
+            state["blocked"] = ("Das IC-7300 antwortet nicht über CI-V (COM Port / Baudrate / CI-V Adresse).\n"
+                                "Verbindung trennen und neu verbinden – das Programm sucht dann die Baudrate.\n"
+                                "Am IC-7300: MENU > SET > Connectors > CI-V > CI-V USB Port = Unlink from [REMOTE].")
+            return state
         choice = str(self.cfg.get("ICOM_TX_SOURCE", "AUTO") or "AUTO").upper()
         off_mod, data_mod = self.icom_read_mod_sources()
         names = self.MOD_NAMES

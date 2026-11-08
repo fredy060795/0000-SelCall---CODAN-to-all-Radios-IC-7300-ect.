@@ -70,8 +70,8 @@ class FakeDevice:
 
     def __init__(self, answer, raw=None):
         self.raw = raw          # raw(data) -> reply, for binary protocols (CI-V)
-        self.master, slave = pty.openpty()
-        self.port = os.ttyname(slave)
+        self.master, self.slave = pty.openpty()
+        self.port = os.ttyname(self.slave)
         self.answer = answer
         self.received = b""
         self.lines = []
@@ -151,8 +151,17 @@ class RadioLinkTest(unittest.TestCase):
         self.assertIn("ERROR", link.send_codan_cics("beacon 435201"))
         link.disconnect()
 
-    def _icom(self, answer):
-        dev = FakeDevice(None, raw=answer)
+    def _icom(self, answer, only_baud=None):
+        def radio(d):
+            if only_baud is not None:
+                import termios
+                speed = termios.tcgetattr(dev.slave)[4]
+                if speed != getattr(termios, f"B{only_baud}"):
+                    return None                       # wrong baud rate: the radio hears garbage
+            if d.rstrip(b"\x00").endswith(b"\x94\xe0\x03\xfd"):                 # read frequency
+                return b"\xfe\xfe\xe0\x94\x03\x00\x00\x07\x14\x00\xfd"
+            return answer(d)
+        dev = FakeDevice(None, raw=radio)
         link = self.make_link({"RADIO_MODEL": "IC-7300", "PTT_METHOD": "CAT", "CAT_ADDRESS": "94",
                                "RIG_SERIAL_PORT": dev.port, "RIG_BAUD": 115200})
         self.assertEqual(link.connect(), [])
@@ -166,6 +175,27 @@ class RadioLinkTest(unittest.TestCase):
         self.assertIn(b"\xfe\xfe\x94\xe0\x1c\x00\x01\xfd", dev.received)
         self.assertIn(b"\xfe\xfe\x94\xe0\x1c\x00\x00\xfd", dev.received)
         self.assertTrue(any("bestätigt" in line for line in self.logs))
+        link.disconnect()
+
+    def test_icom_baud_rate_found_by_itself(self):
+        """IC-7300 linked to REMOTE answers only at 19200 Bd although 115200 is set."""
+        dev, link = self._icom(lambda d: b"\xfe\xfe\xe0\x94\xfb\xfd", only_baud=19200)
+        self.assertEqual(link.rig.baud, 19200)
+        self.assertEqual(link.cfg["RIG_BAUD"], 19200)
+        self.assertTrue(link.cfg_changed)
+        self.assertTrue(link.set_ptt(True))
+        self.assertTrue(any("Unlink from [REMOTE]" in line for line in self.logs))
+        link.disconnect()
+
+    def test_icom_silent_on_every_baud(self):
+        dev = FakeDevice(None, raw=lambda d: None)
+        link = self.make_link({"RADIO_MODEL": "IC-7300", "PTT_METHOD": "CAT", "CAT_PROTOCOL": "ICOM",
+                               "RIG_SERIAL_PORT": dev.port, "RIG_BAUD": 115200})
+        problems = link.connect()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("mit keiner Baudrate", problems[0])
+        self.assertEqual(link.rig.baud, 115200)
+        self.assertIn("blocked", link.icom_prepare_audio_tx())
         link.disconnect()
 
     def test_icom_meter_and_usb_data(self):
@@ -256,7 +286,8 @@ class RadioLinkTest(unittest.TestCase):
         link = self.make_link({"RADIO_MODEL": "CODAN ENVOY", "PTT_METHOD": "CAT", "CAT_PROTOCOL": "ICOM",
                                "RIG_SERIAL_PORT": dev.port, "RIG_BAUD": 115200})
         self.assertFalse(link.is_codan)
-        self.assertEqual(link.connect(), [])
+        link.connect()            # the fake does not answer CI-V: a baud-rate problem is reported, port stays open
+        self.assertTrue(link.rig.is_open)
         self.assertIn("kein Codan", link.send_codan_cics("statuscall 435299"))
         self.assertNotIn(b"statuscall", dev.received)
         link.disconnect()

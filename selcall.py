@@ -960,6 +960,12 @@ class SelCallApp(tk.Tk):
             def _done():
                 self.btn_connect.config(state="normal")
                 self._update_connection_label()
+                if self.link.cfg_changed:                 # baud rate found by itself
+                    self.link.cfg_changed = False
+                    try:
+                        save_config(self.cfg)
+                    except OSError:
+                        pass
                 for problem in problems:
                     self.log(f"FEHLER: {problem}")
                 if problems:
