@@ -1,374 +1,140 @@
-import math
-import struct
-import wave
+"""SelCall Terminal - CODAN / CCIR 493-4, ZVEI, CCIR, DTMF, Necode.
+
+Connection to the radio set up like in HFChat:
+
+  Funkgerät  -> radio model (CODAN NGT, IC-7300 ...; radios.txt adds more)
+  Modem/PTC  -> COM port, baud rate, modem type of the PACTOR modem
+  CAT/RIG    -> COM port, baud rate, CI-V address, protocol of the radio
+  TNC/PTT    -> PTT method CAT / TNC / RTS / DTR / VOX
+
+CODAN radio: the radio sends its own Codan selcall, the program gives the
+CICS command ("selcall 435299") directly (CAT) or through the modem (TNC,
+"TRX T selcall 435299").  Other radios: the PC makes the CCIR 493-4 FSK and
+keys the radio by CAT/RTS/DTR.
+"""
+
 import io
-try:
-    import winsound
-except ImportError:  # not on Windows
-    winsound = None
-import threading
-import time
 import json
 import os
-import serial
-import serial.tools.list_ports
-import sounddevice as sd
+import threading
+import time
+import wave
+
 import numpy as np
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox, ttk
 
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+try:
+    import sounddevice as sd
+except Exception:  # pragma: no cover
+    sd = None
 
-# Tone Frequency Definitions (in Hz)
-TONE_STANDARDS = {
-    "DTMF": {
-        "type": "dtmf",
-        "duration": 100,
-        "gap": 50,
-        "matrix": {
-            "1": (697, 1209), "2": (697, 1336), "3": (697, 1477), "A": (697, 1633),
-            "4": (770, 1209), "5": (770, 1336), "6": (770, 1477), "B": (770, 1633),
-            "7": (852, 1209), "8": (852, 1336), "9": (852, 1477), "C": (852, 1633),
-            "E": (941, 1209), "0": (941, 1336), "F": (941, 1477), "D": (941, 1633)
-        }
-    },
-    "CCIR1": {
-        "type": "sequential",
-        "duration": 100,
-        "gap": 0,
-        "tones": {
-            "1": 1124, "2": 1197, "3": 1275, "4": 1358, "5": 1446,
-            "6": 1540, "7": 1640, "8": 1747, "9": 1860, "0": 1981,
-            "A": 2400, "B": 930, "C": 2247, "D": 990, "E": 2110, "R": 2110
-        }
-    },
-    "CCIR7": {
-        "type": "sequential",
-        "duration": 100,
-        "gap": 0,
-        "tones": {
-            "1": 1124, "2": 1197, "3": 1275, "4": 1358, "5": 1446,
-            "6": 1540, "7": 1640, "8": 1747, "9": 1860, "0": 1981,
-            "A": 2400, "B": 930, "C": 2247, "D": 990, "E": 2110, "R": 2110
-        }
-    },
-    "PCCIR": {
-        "type": "sequential",
-        "duration": 100,
-        "gap": 0,
-        "tones": {
-            "1": 1124, "2": 1197, "3": 1275, "4": 1358, "5": 1446,
-            "6": 1540, "7": 1640, "8": 1747, "9": 1860, "0": 1981,
-            "R": 2110
-        }
-    },
-    "EIA": {
-        "type": "sequential",
-        "duration": 33,
-        "gap": 0,
-        "tones": {
-            "1": 741, "2": 882, "3": 1023, "4": 1164, "5": 1305,
-            "6": 1446, "7": 1587, "8": 1728, "9": 1869, "0": 600,
-            "A": 459, "B": 1091, "C": 2010, "D": 2151, "E": 2292, "R": 459
-        }
-    },
-    "EEA": {
-        "type": "sequential",
-        "duration": 40,
-        "gap": 0,
-        "tones": {
-            "1": 1124, "2": 1197, "3": 1275, "4": 1358, "5": 1446,
-            "6": 1540, "7": 1640, "8": 1747, "9": 1860, "0": 1981,
-            "A": 1055, "B": 930, "C": 2247, "D": 990, "E": 2110, "R": 2110
-        }
-    },
-    "CCITT": {
-        "type": "sequential",
-        "duration": 100,
-        "gap": 0,
-        "tones": {
-            "1": 1124, "2": 1197, "3": 1275, "4": 1358, "5": 1446,
-            "6": 1540, "7": 1640, "8": 1747, "9": 1860, "0": 1981,
-            "A": 2400, "B": 930, "C": 2247, "D": 990, "E": 2110, "R": 2110
-        }
-    },
-    "EURO": {
-        "type": "sequential",
-        "duration": 100,
-        "gap": 0,
-        "tones": {
-            "1": 979.8, "2": 903.1, "3": 832.5, "4": 767.4, "5": 707.4,
-            "6": 652.3, "7": 601.6, "8": 554.9, "9": 511.8, "0": 1062.9
-        }
-    },
-    "NATEL": {
-        "type": "sequential",
-        "duration": 100,
-        "gap": 0,
-        "tones": {
-            "1": 1633, "2": 1633, "3": 1633, "4": 1633, "5": 1633,
-            "6": 1633, "7": 1633, "8": 1633, "9": 1633, "0": 1633
-        }
-    },
-    "VDEW": {
-        "type": "sequential",
-        "duration": 70,
-        "gap": 0,
-        "tones": {
-            "1": 1060, "2": 1160, "3": 1270, "4": 1400, "5": 1530,
-            "6": 1670, "7": 1830, "8": 2000, "9": 2200, "0": 2400
-        }
-    },
-    "MODAT": {
-        "type": "sequential",
-        "duration": 30,
-        "gap": 0,
-        "tones": {
-            "1": 631.0, "2": 741.0, "3": 882.0, "4": 1023.0, "5": 1164.0,
-            "6": 1305.0, "7": 1446.0, "8": 1587.0, "9": 1728.0, "0": 600.0,
-            "R": 459.0
-        }
-    },
-    "ZVEI1": {
-        "type": "sequential",
-        "duration": 70,
-        "gap": 0,
-        "tones": {
-            "1": 1060, "2": 1160, "3": 1270, "4": 1400, "5": 1530,
-            "6": 1670, "7": 1830, "8": 2000, "9": 2200, "0": 2400,
-            "A": 2800, "B": 810, "C": 930, "D": 885, "E": 2600, "R": 2600
-        }
-    },
-    "ZVEI2": {
-        "type": "sequential",
-        "duration": 70,
-        "gap": 0,
-        "tones": {
-            "1": 1060, "2": 1160, "3": 1270, "4": 1400, "5": 1530,
-            "6": 1670, "7": 1830, "8": 2000, "9": 2200, "0": 2400,
-            "A": 885, "B": 810, "C": 930, "D": 1000, "E": 2600, "R": 2600
-        }
-    },
-    "ZVEI3": {
-        "type": "sequential",
-        "duration": 70,
-        "gap": 0,
-        "tones": {
-            "1": 970, "2": 1060, "3": 1160, "4": 1270, "5": 1400,
-            "6": 1530, "7": 1670, "8": 1830, "9": 2000, "0": 2200,
-            "A": 885, "B": 810, "C": 930, "D": 2400, "E": 2600, "R": 2600
-        }
-    },
-    "PZVEI": {
-        "type": "sequential",
-        "duration": 70,
-        "gap": 0,
-        "tones": {
-            "1": 1060, "2": 1160, "3": 1270, "4": 1400, "5": 1530,
-            "6": 1670, "7": 1830, "8": 2000, "9": 2200, "0": 2400,
-            "R": 2600
-        }
-    },
-    "DZVEI": {
-        "type": "sequential",
-        "duration": 70,
-        "gap": 0,
-        "tones": {
-            "1": 970, "2": 1060, "3": 1160, "4": 1270, "5": 1400,
-            "6": 1530, "7": 1670, "8": 1830, "9": 2000, "0": 2200,
-            "R": 2600
-        }
-    },
-    "PDZVEI": {
-        "type": "sequential",
-        "duration": 70,
-        "gap": 0,
-        "tones": {
-            "1": 970, "2": 1060, "3": 1160, "4": 1270, "5": 1400,
-            "6": 1530, "7": 1670, "8": 1830, "9": 2000, "0": 2200,
-            "R": 2600
-        }
-    },
-    "ICAO": {
-        "type": "icao",
-        "duration": 1000,
-        "gap": 200,
-        "tones": {
-            "A": 312.6, "B": 346.7, "C": 384.6, "D": 426.6,
-            "E": 473.2, "F": 524.8, "G": 582.1, "H": 645.7,
-            "J": 716.1, "K": 794.3, "L": 881.0, "M": 977.2,
-            "P": 1083.9, "Q": 1202.3, "R": 1333.5, "S": 1479.1
-        }
-    },
-    "CTCSS": {
-        "type": "ctcss",
-        "duration": 1000,
-        "gap": 0,
-        "tones": {
-            "67.0": 67.0, "71.9": 71.9, "74.4": 74.4, "77.0": 77.0,
-            "79.7": 79.7, "82.5": 82.5, "85.4": 85.4, "88.5": 88.5,
-            "91.5": 91.5, "94.8": 94.8, "97.4": 97.4, "100.0": 100.0,
-            "103.5": 103.5, "107.2": 107.2, "110.9": 110.9, "114.8": 114.8,
-            "118.8": 118.8, "123.0": 123.0, "127.3": 127.3, "131.8": 131.8,
-            "136.5": 136.5, "141.3": 141.3, "146.2": 146.2, "151.4": 151.4,
-            "156.7": 156.7, "162.2": 162.2, "167.9": 167.9, "173.8": 173.8,
-            "179.9": 179.9, "186.2": 186.2, "192.8": 192.8, "203.5": 203.5,
-            "210.7": 210.7, "218.1": 218.1, "225.7": 225.7, "233.6": 233.6,
-            "241.8": 241.8, "250.3": 250.3, "254.1": 254.1
-        }
-    }
+import radio_models
+from radio_link import (CAT_PROTOCOLS, PTC_BAUD_RATES, PTC_MODEM_TYPES, PTT_METHODS, RIG_BAUD_RATES,
+                        DEFAULT_CODAN_BEACON_CMD, DEFAULT_CODAN_SELCALL_CMD, RadioLink, list_serial_ports)
+from selcall_codec import NECODE_TONES, TONE_STANDARDS, AudioGenerator, CodanSelcallEncoder
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+
+DEFAULT_CONFIG = {
+    "RADIO_MODEL": "",
+    "PTC_SERIAL_PORT": "",
+    "PTC_BAUD": 57600,
+    "PTC_MODEM_TYPE": "AUTO",
+    "RIG_SERIAL_PORT": "",
+    "RIG_BAUD": 115200,
+    "CAT_ADDRESS": "94",
+    "CAT_PROTOCOL": "ICOM",
+    "PTT_METHOD": "CAT",
+    "PTT_DELAY_MS": 300,
+    "AUDIO_IN": "",
+    "AUDIO_OUT": "",
+    "OUR_ID": "",
+    "CODAN_MODE": "AUTO",            # AUTO: Codan -> CICS, others -> audio | CICS | AUDIO
+    "CODAN_SELCALL_CMD": DEFAULT_CODAN_SELCALL_CMD,
+    "CODAN_BEACON_CMD": DEFAULT_CODAN_BEACON_CMD,
+    "CODAN_SEND_SELF_ID": False,
+    "CODAN_PREAMBLE_S": 2.0,
+    "AUTO_CONNECT": True,
 }
 
-NECODE_TONES = {
-    "0": 600, "1": 741, "2": 882, "3": 1023, "4": 1164,
-    "5": 1305, "6": 1446, "7": 1587, "8": 1728, "9": 1869
+# settings.json of the old version (lower case keys)
+_OLD_KEYS = {
+    "port": "RIG_SERIAL_PORT", "baud": "RIG_BAUD", "our_id": "OUR_ID",
+    "civ_address": "CAT_ADDRESS", "codan_preamble": "CODAN_PREAMBLE_S",
 }
 
 
-class AudioGenerator:
-    def __init__(self, sample_rate=48000):
-        self.sample_rate = sample_rate
-
-    @staticmethod
-    def _to_pcm(signal):
-        signal = np.clip(signal, -1.0, 1.0)
-        return bytearray((signal * 32767).astype('<i2').tobytes())
-
-    def _ramp(self, signal, ramp_ms=3):
-        n = min(int(self.sample_rate * ramp_ms / 1000.0), len(signal) // 2)
-        if n > 0:
-            ramp = np.linspace(0.0, 1.0, n)
-            signal[:n] *= ramp
-            signal[-n:] *= ramp[::-1]
-        return signal
-
-    def generate_sine_wave(self, frequencies, duration_ms, amplitude=0.5):
-        num_samples = int(self.sample_rate * (duration_ms / 1000.0))
-        if isinstance(frequencies, (int, float)):
-            freqs = [frequencies]
+def load_config() -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return cfg
+    for old, new in _OLD_KEYS.items():
+        if old in data and new not in data:
+            data[new] = data[old]
+    if "audio_out_name" in data and "AUDIO_OUT" not in data:
+        data["AUDIO_OUT"] = data["audio_out_name"]
+    if "audio_in_name" in data and "AUDIO_IN" not in data:
+        data["AUDIO_IN"] = data["audio_in_name"]
+    old_ptt = str(data.get("ptt_mode", ""))
+    if old_ptt and "PTT_METHOD" not in data:
+        if "Icom" in old_ptt:
+            data["PTT_METHOD"], data["CAT_PROTOCOL"] = "CAT", "ICOM"
+        elif "Yaesu" in old_ptt:
+            data["PTT_METHOD"], data["CAT_PROTOCOL"] = "CAT", "Yaesu"
+        elif "Codan Envoy" in old_ptt:
+            data["PTT_METHOD"], data["CAT_PROTOCOL"] = "CAT", "CODAN"
+        elif "Pactor Modem Command" in old_ptt:
+            data["PTT_METHOD"] = "TNC"
         else:
-            freqs = list(frequencies)
-        t = np.arange(num_samples) / self.sample_rate
-        val = np.zeros(num_samples)
-        for f in freqs:
-            if f > 0:
-                val += np.sin(2.0 * np.pi * f * t)
-        val = (val / max(len(freqs), 1)) * amplitude
-        return self._to_pcm(self._ramp(val))
-
-    def generate_tone_sequence(self, tones, amplitude=0.5):
-        """Phase-continuous sequence of single tones: list of (freq_hz, duration_ms)."""
-        freq_per_sample = []
-        for freq, dur in tones:
-            n = int(round(self.sample_rate * dur / 1000.0))
-            freq_per_sample.append(np.full(n, float(freq)))
-        if not freq_per_sample:
-            return bytearray()
-        f = np.concatenate(freq_per_sample)
-        phase = 2.0 * np.pi * np.cumsum(f) / self.sample_rate
-        signal = np.where(f > 0, np.sin(phase), 0.0) * amplitude
-        return self._to_pcm(self._ramp(signal, 5))
-
-    def generate_fsk(self, bits, baud, f_zero, f_one, amplitude=0.5):
-        """Phase-continuous 2-FSK (no clicks between bits)."""
-        bit_ms = 1000.0 / baud
-        # exact sample positions avoid timing drift over long preambles
-        bounds = np.round(np.arange(len(bits) + 1) * self.sample_rate / baud).astype(int)
-        f = np.empty(bounds[-1])
-        for i, b in enumerate(bits):
-            f[bounds[i]:bounds[i + 1]] = f_one if b else f_zero
-        phase = 2.0 * np.pi * np.cumsum(f) / self.sample_rate
-        return self._to_pcm(self._ramp(np.sin(phase) * amplitude, 5))
-
-    def generate_silence(self, duration_ms):
-        num_samples = int(self.sample_rate * (duration_ms / 1000.0))
-        return bytearray(num_samples * 2)
-
-    def create_wav_bytes(self, audio_data):
-        byte_io = io.BytesIO()
-        with wave.open(byte_io, 'wb') as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(self.sample_rate)
-            wav_file.writeframes(audio_data)
-        return byte_io.getvalue()
+            data["PTT_METHOD"] = "RTS"
+    for key in DEFAULT_CONFIG:
+        if key in data:
+            cfg[key] = data[key]
+    return cfg
 
 
-class CodanSelcallEncoder:
-    """CODAN HF selcall = CCIR 493-4 (4-digit) / open 6-digit selcall.
+def save_config(cfg: dict):
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as handle:
+        json.dump({k: cfg.get(k, v) for k, v in DEFAULT_CONFIG.items()}, handle, indent=4, ensure_ascii=False)
 
-    100 baud phase-continuous 2-FSK, 1700 Hz = bit 0, 1870 Hz = bit 1
-    (audio frequencies in USB). Each word = 7 information bits (LSB first)
-    followed by 3 check bits = number of zero bits in the information part
-    (MSB first). Every message word is sent twice (DX / RX, time diversity).
-    """
-    BAUD = 100
-    F_ZERO = 1700.0
-    F_ONE = 1870.0
 
-    FMT_SELCALL = 120       # selective call to individual station
-    FMT_CHANNEL_TEST = 123  # Codan channel test / beacon (radio answers with tones)
-    EOS_ARQ = 117           # end of sequence, acknowledge request
-    PHASING_DX = 125
-    PHASING_RX = [109, 108, 107, 106, 105, 104]
+def audio_devices(kind: str) -> list:
+    """Names of input ('in') or output ('out') devices."""
+    if sd is None:
+        return []
+    key = "max_input_channels" if kind == "in" else "max_output_channels"
+    names = []
+    try:
+        for dev in sd.query_devices():
+            if dev[key] > 0 and dev["name"] not in names:
+                names.append(dev["name"])
+    except Exception:
+        pass
+    return names
 
-    CATEGORIES = {
-        "Routine": 100,
-        "Business": 106,
-        "Safety": 108,
-        "Urgent": 110,
-        "Distress": 112,
-    }
 
-    @staticmethod
-    def word_bits(value):
-        value &= 0x7F
-        bits = [(value >> i) & 1 for i in range(7)]
-        zeros = bits.count(0)
-        bits += [(zeros >> 2) & 1, (zeros >> 1) & 1, zeros & 1]
-        return bits
-
-    @staticmethod
-    def split_id(station_id, label):
-        """4 digits -> 2 symbols, 6 digits -> 3 symbols (each symbol = digit pair 00-99)."""
-        sid = str(station_id).strip().replace(" ", "")
-        if not (sid.isdigit() and len(sid) in (4, 6)):
-            raise ValueError(
-                f"{label} '{sid}' is invalid: CODAN / CCIR 493-4 selcall uses 4 or 6 digits "
-                f"(e.g. 1234 or 435299)."
-            )
-        return [int(sid[i:i + 2]) for i in range(0, len(sid), 2)]
-
-    def build_words(self, call_id, our_id, fmt=FMT_SELCALL, category=100):
-        to = self.split_id(call_id, "Call ID")
-        frm = self.split_id(our_id, "Our ID")
-        if len(to) != len(frm):
-            raise ValueError("Call ID and Our ID must both have 4 digits or both have 6 digits.")
-        # Message in DX order: format, called address, category, self ID, EOS x3
-        dx = [fmt] + to + [category] + frm + [self.EOS_ARQ] * 3
-        # RX copy lags the DX copy by 4 words (time diversity)
-        rx = [dx[0], dx[0]] + dx[:-2]
-        words = []
-        for ph in self.PHASING_RX:
-            words += [self.PHASING_DX, ph]
-        for d, r in zip(dx, rx):
-            words += [d, r]
-        return words
-
-    def build_bits(self, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0):
-        n_pre = max(20, int(round(preamble_s * self.BAUD)))
-        bits = [i & 1 for i in range(n_pre)]  # dot pattern 0101...
-        for w in self.build_words(call_id, our_id, fmt, category):
-            bits += self.word_bits(w)
-        return bits
-
-    def generate(self, audio_gen, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0):
-        bits = self.build_bits(call_id, our_id, fmt, category, preamble_s)
-        return audio_gen.generate_fsk(bits, self.BAUD, self.F_ZERO, self.F_ONE)
+def audio_device_index(name: str, kind: str):
+    if sd is None or not name:
+        return None
+    key = "max_input_channels" if kind == "in" else "max_output_channels"
+    try:
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["name"] == name and dev[key] > 0:
+                return i
+    except Exception:
+        pass
+    return None
 
 
 class AudioDecoderEngine:
-    def __init__(self, app_callback, sample_rate=44100, block_size=2048):
+    """Very simple decoder for sequential tone selcall (ZVEI, CCIR ...)."""
+
+    def __init__(self, app_callback, sample_rate=48000, block_size=2048):
         self.app_callback = app_callback
         self.sample_rate = sample_rate
         self.block_size = block_size
@@ -379,16 +145,13 @@ class AudioDecoderEngine:
 
     def start(self, device_id):
         self.stop()
+        if sd is None:
+            return False
         try:
-            self.is_running = True
-            self.stream = sd.InputStream(
-                device=device_id,
-                channels=1,
-                samplerate=self.sample_rate,
-                blocksize=self.block_size,
-                callback=self._audio_callback
-            )
+            self.stream = sd.InputStream(device=device_id, channels=1, samplerate=self.sample_rate,
+                                         blocksize=self.block_size, callback=self._audio_callback)
             self.stream.start()
+            self.is_running = True
             return True
         except Exception:
             self.is_running = False
@@ -407,30 +170,22 @@ class AudioDecoderEngine:
     def _audio_callback(self, indata, frames, time_info, status):
         if not self.is_running:
             return
-
         signal_data = indata[:, 0]
-        rms = float(np.sqrt(np.mean(signal_data**2)))
+        rms = float(np.sqrt(np.mean(signal_data ** 2)))
         self.app_callback("level", rms)
-
         if rms < 0.02:
             return
-
         fft_data = np.abs(np.fft.rfft(signal_data * np.hanning(len(signal_data))))
         freqs = np.fft.rfftfreq(len(signal_data), 1.0 / self.sample_rate)
-
-        peak_idx = np.argmax(fft_data)
-        peak_freq = float(freqs[peak_idx])
-
-        detected_char = None
+        peak_freq = float(freqs[int(np.argmax(fft_data))])
         current_mode = self.app_callback("get_mode", None)
         mode_cfg = TONE_STANDARDS.get(current_mode, {})
-
+        detected_char = None
         if mode_cfg.get("type") == "sequential":
             for char, freq in mode_cfg.get("tones", {}).items():
                 if abs(peak_freq - freq) < 25:
                     detected_char = char
                     break
-
         if detected_char:
             now = time.time()
             if detected_char != self.last_char or (now - self.last_time) > 0.15:
@@ -439,729 +194,642 @@ class AudioDecoderEngine:
                 self.app_callback("char", (current_mode, detected_char, rms))
 
 
+# =============================================================================
+# Settings (layout like HFChat: Funkgerät, Modem / PTC, CAT / RIG, TNC / PTT)
+# =============================================================================
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.title("Settings - CAT & Audio Configuration")
-        self.geometry("560x540")
-        self.parent = parent
-        self.resizable(False, False)
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.title("Einstellungen")
+        self.resizable(False, True)
+        self.transient(app)
+        cfg = app.cfg
 
-        self.in_dev_map = {}
-        self.out_dev_map = {}
+        outer = ttk.Frame(self, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        self.build_ui()
+        # --- Funkgerät ---------------------------------------------------
+        f_radio = ttk.LabelFrame(outer, text="Funkgerät", padding=8)
+        f_radio.pack(fill=tk.X, pady=4)
+        names = ["(manuell)"]
+        for _group, members in radio_models.grouped_names(app.profiles):
+            names += members
+        self.cb_radio = self._combo(f_radio, 0, "Funkgerät:", names, cfg.get("RADIO_MODEL") or "(manuell)", width=28)
+        self.cb_radio.bind("<<ComboboxSelected>>", lambda _e: self._apply_radio_model())
+        self.lbl_profile = ttk.Label(f_radio, text="", foreground="gray")
+        self.lbl_profile.grid(row=1, column=1, columnspan=3, sticky=tk.W)
 
-    def build_ui(self):
-        id_frame = ttk.LabelFrame(self, text="Station Identification", padding=10)
-        id_frame.pack(fill=tk.X, padx=10, pady=5)
+        # --- Modem / PTC -------------------------------------------------
+        f_ptc = ttk.LabelFrame(outer, text="Modem / PTC  (Funkgerät am Modem → PTT Methode TNC)", padding=8)
+        f_ptc.pack(fill=tk.X, pady=4)
+        self.cb_ptc_port = self._combo(f_ptc, 0, "PTC COM Port:", list_serial_ports(), cfg.get("PTC_SERIAL_PORT", ""),
+                                       editable=True)
+        ttk.Button(f_ptc, text="↻", width=3, command=self._refresh_ports).grid(row=0, column=2, padx=4)
+        self.cb_ptc_baud = self._combo(f_ptc, 1, "PTC Baudrate:", [str(b) for b in PTC_BAUD_RATES],
+                                       str(cfg.get("PTC_BAUD", 57600)))
+        self.cb_ptc_type = self._combo(f_ptc, 2, "PTC Modemtyp:", list(PTC_MODEM_TYPES),
+                                       str(cfg.get("PTC_MODEM_TYPE", "AUTO")))
 
-        ttk.Label(id_frame, text="Self ID / Our ID:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.entry_our_id = ttk.Entry(id_frame, width=15)
-        self.entry_our_id.insert(0, str(self.parent.selected_our_id))
-        self.entry_our_id.grid(row=0, column=1, sticky=tk.W, padx=5, pady=5)
+        # --- CAT / RIG ---------------------------------------------------
+        f_cat = ttk.LabelFrame(outer, text="CAT / RIG  (Funkgerät direkt am PC)", padding=8)
+        f_cat.pack(fill=tk.X, pady=4)
+        self.cb_rig_port = self._combo(f_cat, 0, "RIG COM Port:", list_serial_ports(), cfg.get("RIG_SERIAL_PORT", ""),
+                                       editable=True)
+        ttk.Button(f_cat, text="↻", width=3, command=self._refresh_ports).grid(row=0, column=2, padx=4)
+        self.cb_rig_baud = self._combo(f_cat, 1, "RIG Baudrate:", [str(b) for b in RIG_BAUD_RATES],
+                                       str(cfg.get("RIG_BAUD", 115200)))
+        ttk.Label(f_cat, text="CI-V Adresse (HEX):").grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.e_civ = ttk.Entry(f_cat, width=8)
+        self.e_civ.insert(0, str(cfg.get("CAT_ADDRESS", "94")))
+        self.e_civ.grid(row=2, column=1, sticky=tk.W, pady=2)
+        self.cb_proto = self._combo(f_cat, 3, "Protokoll:", list(CAT_PROTOCOLS), str(cfg.get("CAT_PROTOCOL", "ICOM")))
 
-        ser_frame = ttk.LabelFrame(self, text="Serial / Modem / Radio Interface", padding=10)
-        ser_frame.pack(fill=tk.X, padx=10, pady=5)
+        # --- TNC / PTT ---------------------------------------------------
+        f_ptt = ttk.LabelFrame(outer, text="TNC / PTT", padding=8)
+        f_ptt.pack(fill=tk.X, pady=4)
+        self.cb_ptt = self._combo(f_ptt, 0, "PTT Methode:", list(PTT_METHODS), str(cfg.get("PTT_METHOD", "CAT")))
+        ttk.Label(f_ptt, text="PTT Vorlauf (ms):").grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.sp_delay = ttk.Spinbox(f_ptt, from_=0, to=3000, increment=50, width=8)
+        self.sp_delay.set(str(cfg.get("PTT_DELAY_MS", 300)))
+        self.sp_delay.grid(row=1, column=1, sticky=tk.W, pady=2)
+        ttk.Label(f_ptt, foreground="gray", justify=tk.LEFT, text=(
+            "CAT: PTT-Befehl über den RIG Port (Icom CI-V, Yaesu, Kenwood)\n"
+            "TNC: Funkgerät hängt am Modem – nur Codan (Selcall per CICS über das Modem)\n"
+            "RTS / DTR: Leitung am RIG Port (Interface, IC-7300 USB SEND)\n"
+            "VOX: keine PTT, Funkgerät schaltet selbst")).grid(row=2, column=0, columnspan=3, sticky=tk.W)
 
-        ttk.Label(ser_frame, text="COM Port:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.combo_ports = ttk.Combobox(ser_frame, width=12, state="readonly")
-        self.combo_ports.grid(row=0, column=1, padx=5, pady=5)
+        # --- Audio -------------------------------------------------------
+        f_audio = ttk.LabelFrame(outer, text="Audio (für Selcall vom PC, z.B. IC-7300 USB Audio CODEC)", padding=8)
+        f_audio.pack(fill=tk.X, pady=4)
+        self.cb_out = self._combo(f_audio, 0, "Ausgang (TX):", [""] + audio_devices("out"), cfg.get("AUDIO_OUT", ""),
+                                  width=40)
+        self.cb_in = self._combo(f_audio, 1, "Eingang (RX):", [""] + audio_devices("in"), cfg.get("AUDIO_IN", ""),
+                                 width=40)
 
-        btn_refresh = ttk.Button(ser_frame, text="Refresh", command=self.refresh_all)
-        btn_refresh.grid(row=0, column=2, padx=5, pady=5)
+        # --- Codan -------------------------------------------------------
+        f_codan = ttk.LabelFrame(outer, text="CODAN Selcall", padding=8)
+        f_codan.pack(fill=tk.X, pady=4)
+        ttk.Label(f_codan, text="Eigene ID:").grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.e_our = ttk.Entry(f_codan, width=10)
+        self.e_our.insert(0, str(cfg.get("OUR_ID", "")))
+        self.e_our.grid(row=0, column=1, sticky=tk.W, pady=2)
+        self.cb_mode = self._combo(f_codan, 1, "Selcall erzeugt:", ["AUTO", "CICS", "AUDIO"],
+                                   str(cfg.get("CODAN_MODE", "AUTO")))
+        ttk.Label(f_codan, foreground="gray", text="AUTO: Codan → Funkgerät selbst (CICS), andere → PC (Audio)").grid(
+            row=2, column=0, columnspan=3, sticky=tk.W)
+        ttk.Label(f_codan, text="CICS Selcall:").grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.e_cmd_sel = ttk.Entry(f_codan, width=30)
+        self.e_cmd_sel.insert(0, str(cfg.get("CODAN_SELCALL_CMD", DEFAULT_CODAN_SELCALL_CMD)))
+        self.e_cmd_sel.grid(row=3, column=1, columnspan=2, sticky=tk.W, pady=2)
+        ttk.Label(f_codan, text="CICS Kanaltest:").grid(row=4, column=0, sticky=tk.W, pady=2)
+        self.e_cmd_bea = ttk.Entry(f_codan, width=30)
+        self.e_cmd_bea.insert(0, str(cfg.get("CODAN_BEACON_CMD", DEFAULT_CODAN_BEACON_CMD)))
+        self.e_cmd_bea.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=2)
+        self.v_from = tk.BooleanVar(value=bool(cfg.get("CODAN_SEND_SELF_ID", False)))
+        ttk.Checkbutton(f_codan, text="eigene ID mitsenden („from <ID>“)", variable=self.v_from).grid(
+            row=5, column=1, columnspan=2, sticky=tk.W)
+        ttk.Label(f_codan, foreground="gray", text="{to} = gerufene Station, {self} = eigene ID").grid(
+            row=6, column=0, columnspan=3, sticky=tk.W)
 
-        self.btn_toggle_conn = ttk.Button(
-            ser_frame,
-            text="Disconnect" if (self.parent.ser and self.parent.ser.is_open) else "Connect",
-            command=self.toggle_serial_connection
-        )
-        self.btn_toggle_conn.grid(row=0, column=3, padx=5, pady=5)
+        self.v_auto = tk.BooleanVar(value=bool(cfg.get("AUTO_CONNECT", True)))
+        ttk.Checkbutton(outer, text="Beim Start automatisch verbinden", variable=self.v_auto).pack(anchor=tk.W)
 
-        ttk.Label(ser_frame, text="Baudrate:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.combo_baud = ttk.Combobox(ser_frame, values=["115200", "57600", "38400", "19200", "9600", "4800"], width=12, state="readonly")
-        self.combo_baud.set(str(self.parent.selected_baud))
-        self.combo_baud.grid(row=1, column=1, padx=5, pady=5)
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(buttons, text="Speichern", command=self._save).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(buttons, text="Abbrechen", command=self.destroy).pack(side=tk.RIGHT)
+        self._show_profile()
 
-        ttk.Label(ser_frame, text="PTT Control:").grid(row=2, column=0, sticky=tk.W, padx=5, pady=5)
-        self.combo_ptt_mode = ttk.Combobox(
-            ser_frame,
-            values=[
-                "CI-V & RTS/DTR (Icom IC-7300)",
-                "Yaesu CAT (TX1; / TX0;)",
-                "Codan Envoy / NGT (CICS PTT ON/OFF)",
-                "Codan RTS/DTR Hardware PTT",
-                "Pactor Modem RTS/DTR",
-                "Pactor Modem Command (PTT 1 / PTT 0)"
-            ],
-            width=32, state="readonly"
-        )
-        self.combo_ptt_mode.set(self.parent.selected_ptt_mode)
-        self.combo_ptt_mode.grid(row=2, column=1, columnspan=3, sticky=tk.W, padx=5, pady=5)
+    def _combo(self, parent, row, label, values, current, editable=False, width=14):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
+        combo = ttk.Combobox(parent, values=values, width=width, state="normal" if editable else "readonly")
+        combo.set(current)
+        combo.grid(row=row, column=1, sticky=tk.W, pady=2)
+        return combo
 
-        ttk.Label(ser_frame, text="CI-V Address (hex):").grid(row=3, column=0, sticky=tk.W, padx=5, pady=5)
-        self.entry_civ = ttk.Entry(ser_frame, width=6)
-        self.entry_civ.insert(0, self.parent.selected_civ_address)
-        self.entry_civ.grid(row=3, column=1, sticky=tk.W, padx=5, pady=5)
-        ttk.Label(ser_frame, text="IC-7300 = 94, IC-7610 = 98, IC-705 = A4").grid(
-            row=3, column=2, columnspan=2, sticky=tk.W, padx=5, pady=5)
+    def _refresh_ports(self):
+        ports = list_serial_ports()
+        self.cb_ptc_port["values"] = ports
+        self.cb_rig_port["values"] = ports
 
-        audio_frame = ttk.LabelFrame(self, text="Audio Devices Configuration", padding=10)
-        audio_frame.pack(fill=tk.X, padx=10, pady=5)
+    def _show_profile(self):
+        profile = self.app.profiles.get(self.cb_radio.get())
+        self.lbl_profile.config(text=profile.summary() if profile else "Protokoll / Baudrate unten selbst einstellen")
 
-        ttk.Label(audio_frame, text="Input (Listen):").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-        self.combo_audio_in = ttk.Combobox(audio_frame, width=35, state="readonly")
-        self.combo_audio_in.grid(row=0, column=1, padx=5, pady=5)
+    def _apply_radio_model(self):
+        """Like HFChat: the radio model fills protocol, CI-V address and baud rate."""
+        profile = self.app.profiles.get(self.cb_radio.get())
+        self._show_profile()
+        if profile is None:
+            return
+        self.cb_proto.set(profile.cat_protocol())
+        if profile.address is not None:
+            self.e_civ.delete(0, tk.END)
+            self.e_civ.insert(0, f"{profile.address:02X}")
+        if profile.is_codan:
+            self.cb_rig_baud.set(str(profile.baudrate))
+            if self.cb_ptt.get() not in ("CAT", "TNC"):
+                self.cb_ptt.set("TNC")
 
-        ttk.Label(audio_frame, text="Output (TX):").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.combo_audio_out = ttk.Combobox(audio_frame, width=35, state="readonly")
-        self.combo_audio_out.grid(row=1, column=1, padx=5, pady=5)
-
-        btn_frame = ttk.Frame(self, padding=10)
-        btn_frame.pack(fill=tk.X, side=tk.BOTTOM)
-
-        btn_save = ttk.Button(btn_frame, text="Save", command=self.save_settings)
-        btn_save.pack(side=tk.RIGHT, padx=5)
-
-        btn_cancel = ttk.Button(btn_frame, text="Cancel", command=self.destroy)
-        btn_cancel.pack(side=tk.RIGHT, padx=5)
-
-        self.refresh_all()
-
-    def refresh_all(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.combo_ports['values'] = ports
-        if ports:
-            if self.parent.selected_port in ports:
-                self.combo_ports.set(self.parent.selected_port)
-            else:
-                self.combo_ports.current(0)
-
-        devices = sd.query_devices()
-        in_devs = []
-        out_devs = []
-        self.in_dev_map = {}
-        self.out_dev_map = {}
-
-        for i, dev in enumerate(devices):
-            name = f"{i}: {dev['name']}"
-            if dev['max_input_channels'] > 0:
-                in_devs.append(name)
-                self.in_dev_map[name] = i
-            if dev['max_output_channels'] > 0:
-                out_devs.append(name)
-                self.out_dev_map[name] = i
-
-        self.combo_audio_in['values'] = in_devs
-        self.combo_audio_out['values'] = out_devs
-
-        if in_devs:
-            curr_in_name = next((k for k, v in self.in_dev_map.items() if v == self.parent.selected_audio_in), in_devs[0])
-            self.combo_audio_in.set(curr_in_name)
-        if out_devs:
-            curr_out_name = next((k for k, v in self.out_dev_map.items() if v == self.parent.selected_audio_out), out_devs[0])
-            self.combo_audio_out.set(curr_out_name)
-
-    def toggle_serial_connection(self):
-        if self.parent.ser and self.parent.ser.is_open:
-            self.parent.disconnect_serial()
-            self.btn_toggle_conn.config(text="Connect")
-        else:
-            port = self.combo_ports.get()
-            baud = int(self.combo_baud.get())
-            if not port:
-                messagebox.showerror("Error", "No COM port selected.")
-                return
-            if self.parent.connect_serial(port, baud):
-                self.btn_toggle_conn.config(text="Disconnect")
-
-    def save_settings(self):
-        port = self.combo_ports.get()
-        baud = int(self.combo_baud.get())
-        ptt_mode = self.combo_ptt_mode.get()
-        in_name = self.combo_audio_in.get()
-        out_name = self.combo_audio_out.get()
-        our_id = self.entry_our_id.get().strip()
-
-        civ = self.entry_civ.get().strip().upper() or "94"
+    def _save(self):
+        our = self.e_our.get().strip()
+        if our and not (our.isdigit() and len(our) in (4, 6)):
+            messagebox.showerror("Einstellungen", "Eigene ID: 4 oder 6 Ziffern (z.B. 435299).", parent=self)
+            return
+        civ = self.e_civ.get().strip().lstrip("$") or "94"
         try:
             int(civ, 16)
         except ValueError:
-            messagebox.showerror("Error", "CI-V address must be hexadecimal, e.g. 94.")
+            messagebox.showerror("Einstellungen", "CI-V Adresse muss hexadezimal sein (z.B. 94).", parent=self)
             return
-
-        port_changed = (port != self.parent.selected_port or baud != self.parent.selected_baud)
-        self.parent.selected_port = port
-        self.parent.selected_baud = baud
-        self.parent.selected_ptt_mode = ptt_mode
-        self.parent.selected_our_id = our_id
-        self.parent.selected_civ_address = civ
-
-        if port and (port_changed or not (self.parent.ser and self.parent.ser.is_open)):
-            self.parent.connect_serial(port, baud)
-
-        if hasattr(self.parent, 'codan_our_id'):
-            self.parent.codan_our_id.delete(0, tk.END)
-            self.parent.codan_our_id.insert(0, our_id)
-
-        if in_name in self.in_dev_map:
-            self.parent.selected_audio_in = self.in_dev_map[in_name]
-        if out_name in self.out_dev_map:
-            self.parent.selected_audio_out = self.out_dev_map[out_name]
-
-        self.parent.save_config_file()
-        self.parent.restart_rx_engine()
-
-        messagebox.showinfo("Success", "Settings saved successfully.")
+        try:
+            delay = max(0, int(float(self.sp_delay.get())))
+        except ValueError:
+            delay = 300
+        radio = self.cb_radio.get()
+        cfg = self.app.cfg
+        cfg.update({
+            "RADIO_MODEL": "" if radio == "(manuell)" else radio,
+            "PTC_SERIAL_PORT": self.cb_ptc_port.get().strip(),
+            "PTC_BAUD": int(self.cb_ptc_baud.get()),
+            "PTC_MODEM_TYPE": self.cb_ptc_type.get(),
+            "RIG_SERIAL_PORT": self.cb_rig_port.get().strip(),
+            "RIG_BAUD": int(self.cb_rig_baud.get()),
+            "CAT_ADDRESS": civ.upper(),
+            "CAT_PROTOCOL": self.cb_proto.get(),
+            "PTT_METHOD": self.cb_ptt.get(),
+            "PTT_DELAY_MS": delay,
+            "AUDIO_OUT": self.cb_out.get(),
+            "AUDIO_IN": self.cb_in.get(),
+            "OUR_ID": our,
+            "CODAN_MODE": self.cb_mode.get(),
+            "CODAN_SELCALL_CMD": self.e_cmd_sel.get().strip() or DEFAULT_CODAN_SELCALL_CMD,
+            "CODAN_BEACON_CMD": self.e_cmd_bea.get().strip() or DEFAULT_CODAN_BEACON_CMD,
+            "CODAN_SEND_SELF_ID": bool(self.v_from.get()),
+            "AUTO_CONNECT": bool(self.v_auto.get()),
+        })
+        try:
+            save_config(cfg)
+        except OSError as exc:
+            messagebox.showerror("Einstellungen", f"settings.json konnte nicht gespeichert werden: {exc}", parent=self)
+            return
+        self.app.on_settings_saved()
         self.destroy()
 
 
+# =============================================================================
+# Main window
+# =============================================================================
 class SelCallApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SelCall Terminal")
-        self.geometry("560x680")
-        self.ser = None
-
-        self.selected_port = ""
-        self.selected_baud = 115200
-        self.selected_ptt_mode = "CI-V & RTS/DTR (Icom IC-7300)"
-        self.selected_our_id = "5678"
-        self.selected_audio_in = None
-        self.selected_audio_out = None
-        self.selected_audio_in_name = ""
-        self.selected_audio_out_name = ""
-        self.selected_codan_preamble = 2.0
-        self.selected_civ_address = "94"
-
-        self.load_config_file()
-        self.resolve_audio_devices()
-
+        self.geometry("640x760")
+        self.cfg = load_config()
+        self.profiles = radio_models.load_models(APP_DIR)
         self.audio_gen = AudioGenerator()
         self.codan_encoder = CodanSelcallEncoder()
+        self.link = RadioLink(self.cfg, self.log, self.profiles.get)
         self.tx_lock = threading.Lock()
         self.decoder_engine = AudioDecoderEngine(self.on_decoder_event)
 
-        self.create_menu()
-        self.create_rx_panel()
-        self.create_tabs()
-        self.create_footer()
+        self._build_menu()
+        self._build_connection_bar()
+        self._build_tabs()
+        self._build_log()
+        ttk.Label(self, text="Frederic Tartarone © 2026", padding=(10, 2)).pack(side=tk.BOTTOM, anchor=tk.E)
 
-        if self.selected_port:
-            self.after(300, lambda: self.connect_serial(self.selected_port, self.selected_baud, quiet=True))
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+        self.after(200, self._startup)
 
-    def load_config_file(self):
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    self.selected_port = cfg.get("port", "")
-                    self.selected_baud = cfg.get("baud", 115200)
-                    self.selected_ptt_mode = cfg.get("ptt_mode", "CI-V & RTS/DTR (Icom IC-7300)")
-                    self.selected_our_id = cfg.get("our_id", "5678")
-                    self.selected_audio_in = cfg.get("audio_in", None)
-                    self.selected_audio_out = cfg.get("audio_out", None)
-                    self.selected_audio_in_name = cfg.get("audio_in_name", "")
-                    self.selected_audio_out_name = cfg.get("audio_out_name", "")
-                    self.selected_codan_preamble = float(cfg.get("codan_preamble", 2.0))
-                    self.selected_civ_address = str(cfg.get("civ_address", "94"))
-            except Exception as e:
-                print(f"Error loading settings.json: {e}")
+    # ---------------------------------------------------------------- layout
+    def _build_menu(self):
+        bar = tk.Menu(self)
+        m_file = tk.Menu(bar, tearoff=0)
+        m_file.add_command(label="Einstellungen…", command=self.open_settings)
+        m_file.add_separator()
+        m_file.add_command(label="Beenden", command=self._quit)
+        bar.add_cascade(label="Datei", menu=m_file)
+        self.config(menu=bar)
 
-    @staticmethod
-    def device_name(index):
-        if index is None:
-            return ""
-        try:
-            return sd.query_devices(index)['name']
-        except Exception:
-            return ""
+    def _build_connection_bar(self):
+        frame = ttk.LabelFrame(self, text="Verbindung zum Funkgerät", padding=8)
+        frame.pack(fill=tk.X, padx=10, pady=(8, 4))
+        self.lbl_radio = ttk.Label(frame, text="", font=("Segoe UI", 10, "bold"))
+        self.lbl_radio.grid(row=0, column=0, sticky=tk.W)
+        self.lbl_status = ttk.Label(frame, text="", foreground="gray")
+        self.lbl_status.grid(row=1, column=0, sticky=tk.W)
+        self.btn_connect = ttk.Button(frame, text="Verbinden", command=self.toggle_connection)
+        self.btn_connect.grid(row=0, column=1, rowspan=2, padx=6)
+        ttk.Button(frame, text="⚙ Einstellungen", command=self.open_settings).grid(row=0, column=2, rowspan=2)
+        frame.columnconfigure(0, weight=1)
 
-    def resolve_audio_devices(self):
-        """Device indices change when USB devices are re-plugged: prefer the saved name."""
-        try:
-            devices = sd.query_devices()
-        except Exception:
-            return
-        for attr, kind in (("selected_audio_in", "max_input_channels"),
-                           ("selected_audio_out", "max_output_channels")):
-            name = getattr(self, attr + "_name")
-            if not name:
-                continue
-            idx = getattr(self, attr)
-            if idx is not None and 0 <= idx < len(devices) and devices[idx]['name'] == name:
-                continue
-            for i, dev in enumerate(devices):
-                if dev['name'] == name and dev[kind] > 0:
-                    setattr(self, attr, i)
-                    break
+        cmd = ttk.Frame(frame)
+        cmd.grid(row=2, column=0, columnspan=3, sticky=tk.EW, pady=(6, 0))
+        ttk.Label(cmd, text="Befehl an Funkgerät/Modem:").pack(side=tk.LEFT)
+        self.e_raw = ttk.Entry(cmd, width=28)
+        self.e_raw.pack(side=tk.LEFT, padx=4)
+        self.e_raw.bind("<Return>", lambda _e: self.send_raw_command())
+        ttk.Button(cmd, text="Senden", command=self.send_raw_command).pack(side=tk.LEFT)
+        self._update_connection_label()
 
-    def save_config_file(self):
-        cfg = {
-            "port": self.selected_port,
-            "baud": self.selected_baud,
-            "ptt_mode": self.selected_ptt_mode,
-            "our_id": self.selected_our_id,
-            "audio_in": self.selected_audio_in,
-            "audio_out": self.selected_audio_out,
-            "audio_in_name": self.device_name(self.selected_audio_in),
-            "audio_out_name": self.device_name(self.selected_audio_out),
-            "codan_preamble": self.selected_codan_preamble,
-            "civ_address": self.selected_civ_address
-        }
-        try:
-            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=4)
-        except Exception as e:
-            print(f"Error saving settings.json: {e}")
+    def _build_tabs(self):
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self.tab_codan = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_codan, text="CODAN")
+        self._build_codan_tab()
+        self.tab_tone = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_tone, text="Tone SelCall")
+        self._build_tone_tab()
+        self.tab_necode = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_necode, text="Necode")
+        self._build_necode_tab()
 
-    def create_menu(self):
-        menu_bar = tk.Menu(self)
-        file_menu = tk.Menu(menu_bar, tearoff=0)
-        file_menu.add_command(label="Exit", command=self.quit)
-        menu_bar.add_cascade(label="File", menu=file_menu)
+    def _build_log(self):
+        frame = ttk.LabelFrame(self, text="Protokoll", padding=6)
+        frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=4)
+        top = ttk.Frame(frame)
+        top.pack(fill=tk.X)
+        ttk.Label(top, text="RX Pegel:").pack(side=tk.LEFT)
+        self.progress_level = ttk.Progressbar(top, length=120, mode="determinate")
+        self.progress_level.pack(side=tk.LEFT, padx=4)
+        self.btn_rx = ttk.Button(top, text="RX Decoder Start", command=self.toggle_rx_engine)
+        self.btn_rx.pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Log leeren", command=self.clear_log).pack(side=tk.RIGHT)
+        self.entry_rx_seq = ttk.Entry(top, width=14)
+        self.entry_rx_seq.pack(side=tk.RIGHT, padx=4)
+        self.txt_log = tk.Text(frame, height=10, width=70, state="disabled", font=("Consolas", 9))
+        self.txt_log.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
-        edit_menu = tk.Menu(menu_bar, tearoff=0)
-        edit_menu.add_command(label="Settings", command=self.open_settings)
-        menu_bar.add_cascade(label="Edit", menu=edit_menu)
+    def _build_codan_tab(self):
+        top = ttk.Frame(self.tab_codan, padding=10)
+        top.pack(fill=tk.X)
+        self.codan_priority = tk.StringVar(value="Routine")
+        for p in CodanSelcallEncoder.CATEGORIES:
+            ttk.Radiobutton(top, text=p, value=p, variable=self.codan_priority, style="Toolbutton").pack(
+                side=tk.LEFT, padx=2)
 
-        self.config(menu=menu_bar)
+        form = ttk.Frame(self.tab_codan, padding=10)
+        form.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(form, text="Gerufene Station (4/6 Ziffern):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.codan_call_id = ttk.Entry(form, width=12, font=("Segoe UI", 12))
+        self.codan_call_id.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
+        self.codan_call_id.bind("<Return>", lambda _e: self.send_codan("selcall"))
+        ttk.Label(form, text="Eigene ID:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.lbl_our_id = ttk.Label(form, text="")
+        self.lbl_our_id.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
 
-    def create_rx_panel(self):
-        rx_frame = ttk.LabelFrame(self, text="Receiver / RX SelCall Decoder", padding=10)
-        rx_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(form, text="Vorspann bei Audio (s):").grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.codan_preamble = ttk.Spinbox(form, from_=0.5, to=30, increment=0.5, width=6)
+        self.codan_preamble.set(str(self.cfg.get("CODAN_PREAMBLE_S", 2.0)))
+        self.codan_preamble.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
+        ttk.Label(form, text="2 s Gegenstation auf Kanal, 6–12 s scannt", foreground="gray").grid(
+            row=2, column=2, sticky=tk.W)
 
-        ttk.Label(rx_frame, text="Signal Level:").grid(row=0, column=0, sticky=tk.W, padx=5)
-        self.progress_level = ttk.Progressbar(rx_frame, length=120, mode='determinate')
-        self.progress_level.grid(row=0, column=1, padx=5)
+        buttons = ttk.Frame(form)
+        buttons.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=12)
+        ttk.Button(buttons, text="📞 Selcall senden", command=lambda: self.send_codan("selcall")).pack(
+            side=tk.LEFT, padx=(0, 8), ipady=4)
+        ttk.Button(buttons, text="Kanaltest (Beacon)", command=lambda: self.send_codan("beacon")).pack(
+            side=tk.LEFT, ipady=4)
 
-        self.btn_rx_toggle = ttk.Button(rx_frame, text="Start RX", command=self.toggle_rx_engine)
-        self.btn_rx_toggle.grid(row=0, column=2, padx=5)
+        self.lbl_codan_path = ttk.Label(form, text="", foreground="gray", justify=tk.LEFT)
+        self.lbl_codan_path.grid(row=4, column=0, columnspan=3, sticky=tk.W)
+        self._update_codan_labels()
 
-        btn_clear_rx = ttk.Button(rx_frame, text="Clear RX Log", command=self.clear_rx_log)
-        btn_clear_rx.grid(row=0, column=3, padx=5)
+    def _build_tone_tab(self):
+        top = ttk.Frame(self.tab_tone, padding=10)
+        top.pack(fill=tk.X)
+        self.mode_var = tk.StringVar(value="ZVEI1")
+        self.mode_combo = ttk.Combobox(top, textvariable=self.mode_var, values=list(TONE_STANDARDS.keys()),
+                                       state="readonly", width=15)
+        self.mode_combo.pack(anchor=tk.W, pady=5)
+        self.mode_combo.bind("<<ComboboxSelected>>", self.on_mode_change)
+        seq = ttk.Frame(self.tab_tone, padding=10)
+        seq.pack(fill=tk.X)
+        self.tone_seq_entry = ttk.Entry(seq, width=25)
+        self.tone_seq_entry.insert(0, "12345")
+        self.tone_seq_entry.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(seq, text="Senden", command=self.play_tone_seq).pack(side=tk.LEFT)
+        ttk.Button(seq, text="Löschen", command=lambda: self.tone_seq_entry.delete(0, tk.END)).pack(
+            side=tk.LEFT, padx=4)
+        self.keypad_frame = ttk.Frame(self.tab_tone, padding=10)
+        self.keypad_frame.pack(fill=tk.BOTH, expand=True)
+        self.on_mode_change(None)
 
-        ttk.Label(rx_frame, text="Decoded Sequence:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
-        self.entry_rx_seq = ttk.Entry(rx_frame, width=25)
-        self.entry_rx_seq.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=5, pady=5)
+    def _build_necode_tab(self):
+        form = ttk.Frame(self.tab_necode, padding=20)
+        form.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(form, text="Call ID:").grid(row=0, column=0, sticky=tk.W, pady=10)
+        self.necode_call_id = ttk.Entry(form, width=15)
+        self.necode_call_id.insert(0, "1234")
+        self.necode_call_id.grid(row=0, column=1, sticky=tk.W, padx=10, pady=10)
+        ttk.Button(form, text="Senden", command=self.send_necode).grid(row=1, column=1, sticky=tk.W, padx=10)
 
-        self.txt_rx_log = tk.Text(rx_frame, height=4, width=55, state="disabled")
-        self.txt_rx_log.grid(row=2, column=0, columnspan=4, padx=5, pady=5)
-
-    def log(self, text):
+    # ------------------------------------------------------------ helpers
+    def log(self, text: str):
         def _do():
-            timestamp = time.strftime("%H:%M:%S")
-            self.txt_rx_log.config(state="normal")
-            self.txt_rx_log.insert(tk.END, f"[{timestamp}] {text}\n")
-            self.txt_rx_log.see(tk.END)
-            self.txt_rx_log.config(state="disabled")
-        self.after(0, _do)
+            self.txt_log.config(state="normal")
+            self.txt_log.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {text}\n")
+            self.txt_log.see(tk.END)
+            self.txt_log.config(state="disabled")
+        try:
+            self.after(0, _do)
+        except RuntimeError:
+            pass
 
-    def clear_rx_log(self):
+    def clear_log(self):
         self.entry_rx_seq.delete(0, tk.END)
-        self.txt_rx_log.config(state="normal")
-        self.txt_rx_log.delete("1.0", tk.END)
-        self.txt_rx_log.config(state="disabled")
+        self.txt_log.config(state="normal")
+        self.txt_log.delete("1.0", tk.END)
+        self.txt_log.config(state="disabled")
 
-    def toggle_rx_engine(self):
-        if self.decoder_engine.is_running:
-            self.decoder_engine.stop()
-            self.btn_rx_toggle.config(text="Start RX")
-            self.progress_level['value'] = 0
+    def _codan_uses_cics(self) -> bool:
+        mode = str(self.cfg.get("CODAN_MODE", "AUTO")).upper()
+        if mode == "CICS":
+            return True
+        if mode == "AUDIO":
+            return False
+        return self.link.is_codan
+
+    def _update_connection_label(self):
+        radio = self.cfg.get("RADIO_MODEL") or f"manuell ({self.cfg.get('CAT_PROTOCOL', 'ICOM')})"
+        self.lbl_radio.config(text=f"Funkgerät: {radio}")
+        self.lbl_status.config(text=self.link.status_text())
+        self.btn_connect.config(text="Trennen" if (self.link.rig.is_open or self.link.ptc.is_open) else "Verbinden")
+
+    def _update_codan_labels(self):
+        self.lbl_our_id.config(text=self.cfg.get("OUR_ID") or "– (Einstellungen)")
+        method = self.link.ptt_method
+        if self._codan_uses_cics():
+            way = "über das Modem (TRX T …)" if method == "TNC" else "direkt am RIG Port"
+            text = (f"Weg: Codan sendet den Selcall selbst – CICS-Befehl {way}.\n"
+                    f"Befehl: {self.link.codan_command_text('selcall', '<ID>', str(self.cfg.get('OUR_ID', '')))}")
         else:
-            if self.selected_audio_in is not None:
-                if self.decoder_engine.start(self.selected_audio_in):
-                    self.btn_rx_toggle.config(text="Stop RX")
-                else:
-                    messagebox.showerror("RX Error", "Could not start audio input stream.")
-            else:
-                messagebox.showwarning("Settings Warning", "Please select an Input (Listen) audio device in Settings.")
+            text = (f"Weg: PC erzeugt CCIR 493-4 (100 Bd FSK 1700/1870 Hz), PTT {method}.\n"
+                    "Funkgerät in USB (IC-7300: USB-D, DATA MOD = USB).")
+        self.lbl_codan_path.config(text=text)
 
-    def restart_rx_engine(self):
-        if self.decoder_engine.is_running:
-            self.toggle_rx_engine()
-            self.toggle_rx_engine()
+    # --------------------------------------------------------- connection
+    def _startup(self):
+        if not self.cfg.get("RADIO_MODEL") and not self.cfg.get("RIG_SERIAL_PORT") \
+                and not self.cfg.get("PTC_SERIAL_PORT"):
+            self.log("Bitte zuerst Einstellungen öffnen: Funkgerät, COM Port, PTT Methode")
+            self.open_settings()
+            return
+        if self.cfg.get("AUTO_CONNECT", True):
+            self.connect()
 
-    def on_decoder_event(self, event_type, data):
-        if event_type == "level":
-            scaled_val = min(data * 300, 100)
-            self.progress_level['value'] = scaled_val
-        elif event_type == "get_mode":
-            return self.mode_var.get()
-        elif event_type == "char":
-            mode, char, rms = data
-            self.entry_rx_seq.insert(tk.END, char)
+    def connect(self):
+        self.btn_connect.config(state="disabled")
 
-            timestamp = time.strftime("%H:%M:%S")
-            log_line = f"[{timestamp}] [{mode}] Tone: {char} (RMS: {rms:.3f})\n"
+        def _work():
+            problems = self.link.connect()
 
-            self.txt_rx_log.config(state="normal")
-            self.txt_rx_log.insert(tk.END, log_line)
-            self.txt_rx_log.see(tk.END)
-            self.txt_rx_log.config(state="disabled")
+            def _done():
+                self.btn_connect.config(state="normal")
+                self._update_connection_label()
+                for problem in problems:
+                    self.log(f"FEHLER: {problem}")
+                if problems:
+                    messagebox.showwarning("Verbindung", "\n".join(problems))
+            self.after(0, _done)
+        threading.Thread(target=_work, daemon=True).start()
+
+    def toggle_connection(self):
+        if self.link.rig.is_open or self.link.ptc.is_open:
+            self.link.disconnect()
+            self._update_connection_label()
+        else:
+            self.connect()
 
     def open_settings(self):
         SettingsDialog(self)
 
-    def connect_serial(self, port, baud, quiet=False):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-        try:
-            ser = serial.Serial()
-            ser.port = port
-            ser.baudrate = baud
-            ser.timeout = 0.1
-            ser.write_timeout = 1
-            # pyserial raises DTR/RTS on open by default -> radio could key up
-            ser.dtr = False
-            ser.rts = False
-            ser.open()
-            self.ser = ser
-            self.log(f"Serial {port} @ {baud} connected ({self.selected_ptt_mode})")
-            return True
-        except Exception as e:
-            self.ser = None
-            self.log(f"Serial {port} could not be opened: {e}")
-            if not quiet:
-                messagebox.showerror("Serial Error", f"Could not open {port}: {e}")
-            return False
+    def on_settings_saved(self):
+        self.log("Einstellungen gespeichert")
+        was_connected = self.link.rig.is_open or self.link.ptc.is_open
+        self.link.disconnect()
+        self._update_codan_labels()
+        self._update_connection_label()
+        if was_connected or self.cfg.get("AUTO_CONNECT", True):
+            self.connect()
 
-    def disconnect_serial(self):
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.dtr = False
-                self.ser.rts = False
-            except Exception:
-                pass
-            self.ser.close()
-        self.ser = None
-
-    def ensure_serial(self):
-        if self.ser and self.ser.is_open:
-            return True
-        if self.selected_port:
-            return self.connect_serial(self.selected_port, self.selected_baud, quiet=True)
-        return False
-
-    def civ_frame(self, payload: bytes) -> bytes:
-        try:
-            addr = int(self.selected_civ_address, 16) & 0xFF
-        except ValueError:
-            addr = 0x94
-        return b'\xFE\xFE' + bytes([addr, 0xE0]) + payload + b'\xFD'
-
-    def set_ptt(self, active: bool) -> bool:
-        if not (self.ser and self.ser.is_open):
-            return False
-        try:
-            mode = self.selected_ptt_mode
-
-            # 1. Icom CI-V (cmd 1C 00: 01 = TX, 00 = RX) + USB SEND via RTS/DTR
-            if mode == "CI-V & RTS/DTR (Icom IC-7300)":
-                self.ser.write(self.civ_frame(b'\x1C\x00' + (b'\x01' if active else b'\x00')))
-                self.ser.rts = active
-                self.ser.dtr = active
-
-            # 2. Yaesu CAT Standard (TX1; / TX0;)
-            elif mode == "Yaesu CAT (TX1; / TX0;)":
-                self.ser.write(b"TX1;" if active else b"TX0;")
-                self.ser.rts = active
-                self.ser.dtr = active
-
-            # 3. Codan Envoy / NGT (CICS Interface Command System)
-            elif mode == "Codan Envoy / NGT (CICS PTT ON/OFF)":
-                self.ser.write(b"PTT ON\r\n" if active else b"PTT OFF\r\n")
-                self.ser.rts = active
-
-            # 4./5. Hardware RTS/DTR keying (Codan RFU/console, Pactor modem, interfaces)
-            elif mode in ("Codan RTS/DTR Hardware PTT", "Pactor Modem RTS/DTR"):
-                self.ser.rts = active
-                self.ser.dtr = active
-
-            # 6. Pactor / Modem ASCII Command Mode
-            elif mode == "Pactor Modem Command (PTT 1 / PTT 0)":
-                self.ser.write(b"PTT 1\r\n" if active else b"PTT 0\r\n")
-                self.ser.rts = active
-
-            self.ser.flush()
-            return True
-        except Exception as e:
-            self.log(f"PTT error: {e}")
-            return False
-
-    def play_audio_with_ptt(self, wav_bytes):
-        if not self.tx_lock.acquire(blocking=False):
-            self.log("TX busy - wait until the current transmission is finished")
+    def send_raw_command(self):
+        """Free text command for tests, e.g. Codan CICS 'ver' or PTC 'VER'."""
+        text = self.e_raw.get().strip()
+        if not text:
             return
 
-        if not self.ensure_serial():
-            self.log("WARNING: no serial/CAT connection - PTT is NOT keyed (audio only)")
-        if self.selected_audio_out is None:
-            self.log("WARNING: no TX audio device selected - using Windows default output")
+        def _work():
+            if self.link.ptt_method == "TNC" and self.link.ptc.is_open:
+                self.link.ptc.write((text + "\r").encode("latin-1", errors="ignore"))
+                self.log(f"PTC ← {text}")
+            elif self.link.rig.is_open:
+                self.link.rig.write((text + "\r").encode("latin-1", errors="ignore"))
+                self.log(f"RIG ← {text}")
+            else:
+                self.log("Nicht verbunden")
+        threading.Thread(target=_work, daemon=True).start()
+        self.e_raw.delete(0, tk.END)
 
-        rx_was_running = self.decoder_engine.is_running
+    # --------------------------------------------------------------- TX
+    def play_audio_with_ptt(self, wav_bytes: bytes, label: str):
+        problem = self.link.can_key_audio()
+        if problem:
+            self.log(f"FEHLER: {problem}")
+            messagebox.showerror("Senden nicht möglich", problem)
+            return
+        if sd is None:
+            messagebox.showerror("Audio", "sounddevice ist nicht installiert (py -m pip install sounddevice)")
+            return
+        out_name = self.cfg.get("AUDIO_OUT", "")
+        out_dev = audio_device_index(out_name, "out")
+        if out_name and out_dev is None:
+            self.log(f"WARNUNG: Audio-Ausgang '{out_name}' nicht gefunden – Standardgerät")
+        elif not out_name:
+            self.log("WARNUNG: kein Audio-Ausgang eingestellt – Windows-Standardgerät")
+        if not self.tx_lock.acquire(blocking=False):
+            self.log("Sender belegt – bitte warten")
+            return
+        rx_running = self.decoder_engine.is_running
 
         def _play():
             try:
-                if rx_was_running:
+                if rx_running:
                     self.decoder_engine.stop()
-                keyed = self.set_ptt(True)
-                if keyed:
-                    self.log("PTT ON")
-                time.sleep(0.3)  # let the transmitter / ALC settle
-
-                wav_io = io.BytesIO(wav_bytes)
-                with wave.open(wav_io, 'rb') as wf:
-                    data = wf.readframes(wf.getnframes())
+                with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
                     rate = wf.getframerate()
-                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                    frames = wf.readframes(wf.getnframes())
+                samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+                self.log(f"TX {label} ({len(samples) / rate:.1f} s)")
+                if not self.link.set_ptt(True):
+                    self.log("FEHLER: PTT konnte nicht geschaltet werden")
+                    return
+                time.sleep(max(0, int(self.cfg.get("PTT_DELAY_MS", 300))) / 1000.0)
                 try:
-                    sd.play(samples, samplerate=rate, device=self.selected_audio_out, blocking=True)
-                except Exception as e:
-                    self.log(f"Audio output error ({e}) - falling back to default device")
-                    if winsound is not None:
-                        winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
-                    else:
-                        sd.play(samples, samplerate=rate, blocking=True)
-
+                    sd.play(samples, samplerate=rate, device=out_dev, blocking=True)
+                except Exception as exc:
+                    self.log(f"Audio Fehler: {exc}")
                 time.sleep(0.15)
             finally:
-                if self.set_ptt(False):
-                    self.log("PTT OFF")
-                if rx_was_running:
-                    self.after(0, lambda: self.decoder_engine.start(self.selected_audio_in))
+                self.link.set_ptt(False)
+                if rx_running:
+                    self.after(0, self.toggle_rx_engine)
                 self.tx_lock.release()
 
         threading.Thread(target=_play, daemon=True).start()
 
-    def create_tabs(self):
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 0))
+    def send_codan(self, kind: str):
+        to_id = self.codan_call_id.get().strip().replace(" ", "")
+        our_id = str(self.cfg.get("OUR_ID", "")).strip()
+        if not (to_id.isdigit() and len(to_id) in (4, 6)):
+            messagebox.showerror("CODAN", "Gerufene Station: 4 oder 6 Ziffern (z.B. 435299).")
+            return
+        name = "Selcall" if kind == "selcall" else "Kanaltest"
 
-        self.tab_tone = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_tone, text="Tone SelCall")
-        self.build_tone_tab()
+        if self._codan_uses_cics():
+            command = self.link.codan_command_text(kind, to_id, our_id)
 
-        self.tab_codan = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_codan, text="CODAN")
-        self.build_codan_tab()
-
-        self.tab_necode = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_necode, text="Necode")
-        self.build_necode_tab()
-
-    def create_footer(self):
-        footer_frame = ttk.Frame(self, padding=(10, 5))
-        footer_frame.pack(fill=tk.X, side=tk.BOTTOM)
-
-        copyright_label = ttk.Label(footer_frame, text="Frederic Tartarone © 2026")
-        copyright_label.pack(side=tk.RIGHT)
-
-    def build_tone_tab(self):
-        top_frame = ttk.Frame(self.tab_tone, padding=10)
-        top_frame.pack(fill=tk.X)
-
-        self.mode_var = tk.StringVar(value="DTMF")
-        self.mode_combo = ttk.Combobox(
-            top_frame, textvariable=self.mode_var,
-            values=list(TONE_STANDARDS.keys()), state="readonly", width=15
-        )
-        self.mode_combo.pack(anchor=tk.W, pady=5)
-        self.mode_combo.bind("<<ComboboxSelected>>", self.on_mode_change)
-
-        seq_frame = ttk.Frame(self.tab_tone, padding=10)
-        seq_frame.pack(fill=tk.X)
-
-        self.tone_seq_entry = ttk.Entry(seq_frame, width=25)
-        self.tone_seq_entry.insert(0, "1 123 456 7890")
-        self.tone_seq_entry.pack(side=tk.LEFT, padx=(0, 10))
-
-        btn_play = ttk.Button(seq_frame, text="Play", command=self.play_tone_seq)
-        btn_play.pack(side=tk.LEFT)
-
-        self.keypad_frame = ttk.Frame(self.tab_tone, padding=10)
-        self.keypad_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.on_mode_change(None)
-
-    def on_mode_change(self, event):
-        mode_name = self.mode_var.get()
-        mode_cfg = TONE_STANDARDS[mode_name]
-
-        for widget in self.keypad_frame.winfo_children():
-            widget.destroy()
-
-        if mode_cfg["type"] == "dtmf":
-            keys = [
-                ["1", "2", "3", "A"],
-                ["4", "5", "6", "B"],
-                ["7", "8", "9", "C"],
-                ["E", "0", "F", "D"]
-            ]
-            for r, row in enumerate(keys):
-                for c, k in enumerate(row):
-                    btn = ttk.Button(self.keypad_frame, text=k, width=5, command=lambda key=k: self.append_tone_key(key))
-                    btn.grid(row=r, column=c, padx=5, pady=5)
-        elif mode_cfg["type"] == "ctcss":
-            keys = list(mode_cfg["tones"].keys())
-            cols = 4
-            for idx, k in enumerate(keys):
-                r = idx // cols
-                c = idx % cols
-                btn = ttk.Button(self.keypad_frame, text=k, width=6, command=lambda key=k: self.append_tone_key(key))
-                btn.grid(row=r, column=c, padx=2, pady=2)
-        else:
-            keys = list(mode_cfg["tones"].keys())
-            cols = 4
-            for idx, k in enumerate(keys):
-                r = idx // cols
-                c = idx % cols
-                btn = ttk.Button(self.keypad_frame, text=k, width=5, command=lambda key=k: self.append_tone_key(key))
-                btn.grid(row=r, column=c, padx=5, pady=5)
-
-    def append_tone_key(self, key):
-        current = self.tone_seq_entry.get()
-        self.tone_seq_entry.delete(0, tk.END)
-        self.tone_seq_entry.insert(0, current + key)
-
-    def play_tone_seq(self):
-        seq = self.tone_seq_entry.get().replace(" ", "")
-        if not seq:
+            def _work():
+                if not self.link.connected:
+                    self.log("Nicht verbunden – verbinde …")
+                    for problem in self.link.connect():
+                        self.log(f"FEHLER: {problem}")
+                    self.after(0, self._update_connection_label)
+                self.log(f"CODAN {name} an {to_id} per CICS: {command}")
+                problem = self.link.send_codan_cics(command)
+                if problem:
+                    self.log(f"FEHLER: {problem}")
+                    self.after(0, lambda: messagebox.showerror("CODAN", problem))
+                else:
+                    self.log(f"{name} übergeben – Codan sendet jetzt selbst")
+            threading.Thread(target=_work, daemon=True).start()
             return
 
+        # PC makes the CCIR 493-4 signal
+        if not (our_id.isdigit() and len(our_id) == len(to_id)):
+            messagebox.showerror("CODAN", "Eigene ID (Einstellungen) muss gleich viele Ziffern haben wie die "
+                                          "gerufene Station (4 oder 6).")
+            return
+        try:
+            preamble = max(0.2, float(self.codan_preamble.get().replace(",", ".")))
+        except ValueError:
+            preamble = 2.0
+        self.cfg["CODAN_PREAMBLE_S"] = preamble
+        fmt = CodanSelcallEncoder.FMT_SELCALL if kind == "selcall" else CodanSelcallEncoder.FMT_CHANNEL_TEST
+        category = CodanSelcallEncoder.CATEGORIES.get(self.codan_priority.get(), 100)
+        try:
+            audio = self.codan_encoder.generate(self.audio_gen, to_id, our_id, fmt=fmt, category=category,
+                                                preamble_s=preamble)
+        except ValueError as exc:
+            messagebox.showerror("CODAN", str(exc))
+            return
+        self.play_audio_with_ptt(self.audio_gen.create_wav_bytes(audio),
+                                 f"CODAN {name} {our_id} → {to_id} (CCIR 493-4, Vorspann {preamble:.1f} s)")
+
+    # ------------------------------------------------------ tone selcall
+    def on_mode_change(self, _event):
+        mode_cfg = TONE_STANDARDS[self.mode_var.get()]
+        for widget in self.keypad_frame.winfo_children():
+            widget.destroy()
+        if mode_cfg["type"] == "dtmf":
+            rows = [["1", "2", "3", "A"], ["4", "5", "6", "B"], ["7", "8", "9", "C"], ["E", "0", "F", "D"]]
+            for r, row in enumerate(rows):
+                for c, k in enumerate(row):
+                    ttk.Button(self.keypad_frame, text=k, width=5,
+                               command=lambda key=k: self.append_tone_key(key)).grid(row=r, column=c, padx=5, pady=5)
+        else:
+            width = 6 if mode_cfg["type"] == "ctcss" else 5
+            for idx, k in enumerate(mode_cfg["tones"].keys()):
+                ttk.Button(self.keypad_frame, text=k, width=width,
+                           command=lambda key=k: self.append_tone_key(key)).grid(
+                    row=idx // 4, column=idx % 4, padx=3, pady=3)
+
+    def append_tone_key(self, key):
+        if TONE_STANDARDS[self.mode_var.get()]["type"] == "ctcss":
+            self.tone_seq_entry.delete(0, tk.END)
+        self.tone_seq_entry.insert(tk.END, key)
+
+    def play_tone_seq(self):
+        seq = self.tone_seq_entry.get().replace(" ", "").upper()
+        if not seq:
+            return
         mode_name = self.mode_var.get()
         mode_cfg = TONE_STANDARDS[mode_name]
-        dur = mode_cfg["duration"]
-        gap = mode_cfg["gap"]
-
-        combined_audio = bytearray()
-        prev_key = None
-
+        dur, gap = mode_cfg["duration"], mode_cfg["gap"]
+        audio = bytearray()
         if mode_cfg["type"] == "dtmf":
             for char in seq:
                 if char in mode_cfg["matrix"]:
-                    freqs = mode_cfg["matrix"][char]
-                    combined_audio.extend(self.audio_gen.generate_sine_wave(freqs, dur))
+                    audio.extend(self.audio_gen.generate_sine_wave(mode_cfg["matrix"][char], dur))
                     if gap > 0:
-                        combined_audio.extend(self.audio_gen.generate_silence(gap))
+                        audio.extend(self.audio_gen.generate_silence(gap))
         elif mode_cfg["type"] == "ctcss":
             if seq in mode_cfg["tones"]:
-                freqs = mode_cfg["tones"][seq]
-                combined_audio.extend(self.audio_gen.generate_sine_wave(freqs, dur))
+                audio.extend(self.audio_gen.generate_sine_wave(mode_cfg["tones"][seq], dur))
         else:
-            tones = []
+            tones, prev = [], None
             for char in seq:
                 if char not in mode_cfg["tones"]:
                     continue
-                target_char = char
-                # repeated digit -> repeat tone (R), e.g. 1 1 1 -> 1 R 1
-                if char == prev_key and "R" in mode_cfg["tones"]:
-                    target_char = "R"
-                tones.append((mode_cfg["tones"][target_char], dur))
+                target = "R" if (char == prev and "R" in mode_cfg["tones"]) else char
+                tones.append((mode_cfg["tones"][target], dur))
                 if gap > 0:
                     tones.append((0, gap))
-                prev_key = target_char
-            combined_audio.extend(self.audio_gen.generate_tone_sequence(tones))
-
-        if combined_audio:
-            wav_bytes = self.audio_gen.create_wav_bytes(combined_audio)
-            self.play_audio_with_ptt(wav_bytes)
-
-    def build_codan_tab(self):
-        btn_frame = ttk.Frame(self.tab_codan, padding=10)
-        btn_frame.pack(fill=tk.X)
-
-        self.codan_priority = tk.StringVar(value="Routine")
-        for p in CodanSelcallEncoder.CATEGORIES:
-            btn = ttk.Radiobutton(btn_frame, text=p, value=p, variable=self.codan_priority, style="Toolbutton")
-            btn.pack(side=tk.LEFT, padx=2)
-
-        form_frame = ttk.Frame(self.tab_codan, padding=10)
-        form_frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(form_frame, text="Call ID (4/6 digits):").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.codan_call_id = ttk.Entry(form_frame, width=15)
-        self.codan_call_id.insert(0, "1234")
-        self.codan_call_id.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
-
-        ttk.Label(form_frame, text="Our ID (4/6 digits):").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.codan_our_id = ttk.Entry(form_frame, width=15)
-        self.codan_our_id.insert(0, str(self.selected_our_id))
-        self.codan_our_id.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
-
-        ttk.Label(form_frame, text="Preamble (s):").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.codan_preamble = ttk.Spinbox(form_frame, from_=0.5, to=30, increment=0.5, width=6)
-        self.codan_preamble.set(str(self.selected_codan_preamble))
-        self.codan_preamble.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
-        ttk.Label(form_frame, text="2 s = radio on channel, 6-12 s = radio scanning").grid(
-            row=2, column=2, sticky=tk.W, pady=5)
-
-        btn_send = ttk.Button(form_frame, text="Send SelCall", command=self.send_codan)
-        btn_send.grid(row=3, column=1, sticky=tk.W, padx=10, pady=15)
-
-        btn_test = ttk.Button(form_frame, text="Channel Test", command=self.send_codan_channel_test)
-        btn_test.grid(row=3, column=2, sticky=tk.W, padx=5, pady=15)
-
-        ttk.Label(
-            form_frame,
-            text="CCIR 493-4 / CODAN: 100 Bd FSK 1700/1870 Hz. Radio in USB (IC-7300: USB-D).",
-            foreground="gray"
-        ).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=5)
-
-    def _codan_preamble_seconds(self):
-        try:
-            return max(0.2, float(self.codan_preamble.get().replace(",", ".")))
-        except ValueError:
-            return 2.0
-
-    def _send_codan_frame(self, fmt):
-        call_id = self.codan_call_id.get().strip()
-        our_id = self.codan_our_id.get().strip()
-        category = CodanSelcallEncoder.CATEGORIES.get(self.codan_priority.get(), 100)
-        preamble = self._codan_preamble_seconds()
-        try:
-            audio = self.codan_encoder.generate(
-                self.audio_gen, call_id, our_id, fmt=fmt, category=category, preamble_s=preamble)
-        except ValueError as e:
-            messagebox.showerror("CODAN SelCall", str(e))
-            return
-        self.selected_codan_preamble = preamble
-        self.log(f"TX CODAN {'Selcall' if fmt == CodanSelcallEncoder.FMT_SELCALL else 'Channel Test'} "
-                 f"{our_id} -> {call_id} ({self.codan_priority.get()}, preamble {preamble:.1f} s)")
-        self.play_audio_with_ptt(self.audio_gen.create_wav_bytes(audio))
-
-    def send_codan(self):
-        self._send_codan_frame(CodanSelcallEncoder.FMT_SELCALL)
-
-    def send_codan_channel_test(self):
-        self._send_codan_frame(CodanSelcallEncoder.FMT_CHANNEL_TEST)
-
-    def build_necode_tab(self):
-        form_frame = ttk.Frame(self.tab_necode, padding=20)
-        form_frame.pack(fill=tk.BOTH, expand=True)
-
-        ttk.Label(form_frame, text="Call ID:").grid(row=0, column=0, sticky=tk.W, pady=10)
-        self.necode_call_id = ttk.Entry(form_frame, width=15)
-        self.necode_call_id.insert(0, "1234")
-        self.necode_call_id.grid(row=0, column=1, sticky=tk.W, padx=10, pady=10)
-
-        btn_send = ttk.Button(form_frame, text="Send", command=self.send_necode)
-        btn_send.grid(row=1, column=1, sticky=tk.W, padx=10, pady=20)
+                prev = target
+            audio.extend(self.audio_gen.generate_tone_sequence(tones))
+        if audio:
+            self.play_audio_with_ptt(self.audio_gen.create_wav_bytes(audio), f"{mode_name} {seq}")
 
     def send_necode(self):
         call_id = self.necode_call_id.get().strip()
-        combined_audio = bytearray()
+        tones = [(NECODE_TONES[c], 100) for c in call_id if c in NECODE_TONES]
+        if tones:
+            audio = self.audio_gen.generate_tone_sequence(tones)
+            self.play_audio_with_ptt(self.audio_gen.create_wav_bytes(audio), f"Necode {call_id}")
 
-        for char in call_id:
-            if char in NECODE_TONES:
-                freq = NECODE_TONES[char]
-                combined_audio.extend(self.audio_gen.generate_sine_wave(freq, 100))
+    # ------------------------------------------------------------- RX
+    def toggle_rx_engine(self):
+        if self.decoder_engine.is_running:
+            self.decoder_engine.stop()
+            self.btn_rx.config(text="RX Decoder Start")
+            self.progress_level["value"] = 0
+            return
+        dev = audio_device_index(self.cfg.get("AUDIO_IN", ""), "in")
+        if dev is None and self.cfg.get("AUDIO_IN"):
+            self.log(f"Audio-Eingang '{self.cfg.get('AUDIO_IN')}' nicht gefunden")
+            return
+        if self.decoder_engine.start(dev):
+            self.btn_rx.config(text="RX Decoder Stop")
+        else:
+            messagebox.showerror("RX", "Audio-Eingang konnte nicht gestartet werden.")
 
-        if combined_audio:
-            wav_bytes = self.audio_gen.create_wav_bytes(combined_audio)
-            self.play_audio_with_ptt(wav_bytes)
+    def on_decoder_event(self, event_type, data):
+        if event_type == "get_mode":
+            return self.mode_var.get()
+        if event_type == "level":
+            self.after(0, lambda: self.progress_level.configure(value=min(data * 300, 100)))
+        elif event_type == "char":
+            mode, char, rms = data
+
+            def _show():
+                self.entry_rx_seq.insert(tk.END, char)
+                self.log(f"RX [{mode}] Ton {char} (RMS {rms:.3f})")
+            self.after(0, _show)
+        return None
+
+    def _quit(self):
+        try:
+            self.link.set_ptt(False)
+        except Exception:
+            pass
+        self.decoder_engine.stop()
+        self.link.disconnect()
+        self.destroy()
 
 
 if __name__ == "__main__":
-    app = SelCallApp()
-    app.mainloop()
+    SelCallApp().mainloop()
