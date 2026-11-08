@@ -1054,14 +1054,14 @@ class SelCallApp(tk.Tk):
         """Icom: read ALC/Po during TX - shows at once whether the tone reaches the radio."""
         if self.link.ptt_method != "CAT" or self.link.cat_protocol.upper() != "ICOM" or duration < 0.8:
             return
-        time.sleep(0.5)
-        po, alc = self.link.icom_meter("PO"), self.link.icom_meter("ALC")
+        time.sleep(0.3)
+        po, alc = self.link.icom_meters_max(min(2.0, duration - 0.5))
         if po is None and alc is None:
             return
-        self.log(f"Während TX: Leistung {po} / ALC {alc} (0–255)")
+        self.log(f"Während TX: Leistung max {po} / ALC max {alc} (0–255)")
         if not po and not alc:
-            self.log("WARNUNG: kein Ton am Funkgerät (Leistung 0) – falsche Soundkarte, oder am IC-7300 "
-                     "nicht USB-D / DATA MOD ≠ USB / USB MOD Level 0 %")
+            self.log("WARNUNG: kein Ton am Funkgerät (Leistung 0) – falsche Soundkarte, Windows-Lautstärke "
+                     "der Soundkarte stumm/0, oder am IC-7300 nicht USB-D / DATA MOD ≠ USB / USB MOD Level 0 %")
 
     def find_radio_soundcard(self, done=None):
         """Icom with CAT: key up, play a tone on each sound card, read the power.
@@ -1083,13 +1083,13 @@ class SelCallApp(tk.Tk):
             messagebox.showerror("Sendetest", "Keine Soundkarten gefunden (py -m pip install sounddevice?).")
             return
         if not messagebox.askyesno("Sendetest", (
-                f"Das Funkgerät sendet jetzt bis zu {len(candidates)}× kurz (je 1 s, 1000 Hz).\n"
+                f"Das Funkgerät sendet jetzt bis zu {len(candidates)}× kurz (je 2,5 s, 1000 Hz).\n"
                 "Antenne/Dummy Load anschließen, wenig Leistung, freie Frequenz im Amateurband.\n"
                 "Am PC kann es dabei kurz piepen (das sind die falschen Soundkarten).\n\nStarten?")):
             return
         if self.link.icom_set_usb_data():
             self.log("Hinweis: USB-D konnte nicht gesetzt werden – am Funkgerät DATA-Taste drücken")
-        tone = np.frombuffer(bytes(self.audio_gen.generate_sine_wave(1000, 1000, amplitude=0.4)),
+        tone = np.frombuffer(bytes(self.audio_gen.generate_sine_wave(1000, 2500, amplitude=0.4)),
                              dtype="<i2").astype(np.float32) / 32768.0
         rate = self.audio_gen.sample_rate
 
@@ -1103,19 +1103,19 @@ class SelCallApp(tk.Tk):
                     if not self.link.set_ptt(True):
                         self.log("Sendetest abgebrochen: PTT geht nicht (siehe oben)")
                         break
-                    best = 0
+                    best, po, alc = 0, None, None
                     try:
                         time.sleep(0.25)
                         sd.play(tone, samplerate=rate, device=idx)
-                        for _ in range(3):
-                            time.sleep(0.2)
-                            best = max(best, self.link.icom_meter("PO") or 0, self.link.icom_meter("ALC") or 0)
+                        time.sleep(0.3)                          # Windows needs a moment to start the sound
+                        po, alc = self.link.icom_meters_max(1.8)  # measure over the whole tone
+                        best = max(po or 0, alc or 0)
                         sd.wait()
                     except Exception as exc:
                         self.log(f"Sendetest {name}: {exc}")
                     finally:
                         self.link.set_ptt(False)
-                    self.log(f"Sendetest {name}: Leistung/ALC {best}")
+                    self.log(f"Sendetest {name}: Leistung max {po} / ALC max {alc}")
                     results.append((best, name))
                     time.sleep(0.4)
             results.sort(reverse=True)
@@ -1124,7 +1124,9 @@ class SelCallApp(tk.Tk):
             def _finish():
                 if winner is None:
                     messagebox.showwarning("Sendetest", (
-                        "Bei keiner Soundkarte kam Leistung heraus.\n\nAm IC-7300 prüfen:\n"
+                        "Bei keiner Soundkarte kam Leistung heraus.\n\n"
+                        "Windows: Sound-Einstellungen → 'Lautsprecher (USB Audio CODEC)' → Lautstärke nicht 0, "
+                        "nicht stumm\n\nAm IC-7300 prüfen:\n"
                         "• Betriebsart USB-D (DATA-Taste)\n"
                         "• MENU > SET > Connectors > MOD Input > DATA MOD = USB\n"
                         "• MENU > SET > Connectors > USB MOD Level nicht 0 %\n"

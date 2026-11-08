@@ -112,7 +112,7 @@ class SerialLine:
         ser = serial.Serial()
         ser.port = port
         ser.baudrate = int(baud)
-        ser.timeout = 0.1
+        ser.timeout = 0.03        # short: CI-V answers (no line end) are passed on quickly
         ser.write_timeout = 2
         ser.rtscts = rtscts
         # pyserial raises DTR/RTS on open -> a radio with USB SEND = DTR/RTS
@@ -475,6 +475,19 @@ class RadioLink:
             return int(f"{data[0]:02X}{data[1]:02X}")      # BCD 0000..0255
         except ValueError:
             return None
+
+    def icom_meters_max(self, seconds: float) -> tuple:
+        """Highest Po and ALC (0..255) read again and again for `seconds`; (None, None) if unreadable."""
+        end = time.time() + seconds
+        po = alc = None
+        while time.time() < end:
+            value = self.icom_meter("PO")
+            if value is not None:
+                po = max(po or 0, value)
+            value = self.icom_meter("ALC")
+            if value is not None:
+                alc = max(alc or 0, value)
+        return po, alc
 
     def icom_set_usb_data(self) -> str:
         """Mode USB + DATA on (USB-D), as needed for audio from the USB sound card."""
