@@ -142,6 +142,7 @@ class RadioLinkTest(unittest.TestCase):
     def test_codan_direct_cat(self):
         dev = FakeDevice(lambda line: b"\r\nOK\r\n" if line.startswith(b"selcall") else b"\r\nERROR: bad\r\n")
         link = self.make_link({"RADIO_MODEL": "CODAN ENVOY", "PTT_METHOD": "CAT", "CODAN_SEND_SELF_ID": True,
+                               "CAT_PROTOCOL": "CODAN",
                                "RIG_SERIAL_PORT": dev.port, "RIG_BAUD": 9600})
         self.assertEqual(link.connect(), [])
         command = link.codan_command_text("selcall", "435201", "435299")
@@ -194,6 +195,19 @@ class RadioLinkTest(unittest.TestCase):
         self.assertTrue(link.set_ptt(False))
         self.assertTrue(any("KEINE Antwort" in line for line in self.logs))
         link.disconnect()
+
+    def test_codan_model_but_icom_on_the_port_uses_audio(self):
+        """Radio model 'CODAN ...' chosen, but an IC-7300 (ICOM) answers on the RIG port."""
+        dev = FakeDevice(lambda line: None)
+        link = self.make_link({"RADIO_MODEL": "CODAN ENVOY", "PTT_METHOD": "CAT", "CAT_PROTOCOL": "ICOM",
+                               "RIG_SERIAL_PORT": dev.port, "RIG_BAUD": 115200})
+        self.assertFalse(link.is_codan)
+        self.assertEqual(link.connect(), [])
+        self.assertIn("kein Codan", link.send_codan_cics("statuscall 435299"))
+        self.assertNotIn(b"statuscall", dev.received)
+        link.disconnect()
+        tnc = self.make_link({"RADIO_MODEL": "CODAN NGT", "PTT_METHOD": "TNC", "CAT_PROTOCOL": "ICOM"})
+        self.assertTrue(tnc.is_codan)
 
     def test_tnc_without_codan_cannot_key_audio(self):
         link = self.make_link({"RADIO_MODEL": "IC-7300", "PTT_METHOD": "TNC"})

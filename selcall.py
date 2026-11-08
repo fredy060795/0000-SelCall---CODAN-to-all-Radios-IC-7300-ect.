@@ -288,7 +288,8 @@ class SettingsDialog(tk.Toplevel):
         self.lbl_auto.pack(side=tk.LEFT, padx=8)
 
         # --- Funkgerät ---------------------------------------------------
-        f_radio = ttk.LabelFrame(outer, text="Funkgerät", padding=8)
+        f_radio = ttk.LabelFrame(outer, text="Eigenes Funkgerät (am PC bzw. Modem – nicht die Gegenstation)",
+                                 padding=8)
         f_radio.pack(fill=tk.X, pady=4)
         names = ["(manuell)"]
         for _group, members in radio_models.grouped_names(app.profiles):
@@ -322,6 +323,7 @@ class SettingsDialog(tk.Toplevel):
         self.e_civ.insert(0, str(cfg.get("CAT_ADDRESS", "94")))
         self.e_civ.grid(row=2, column=1, sticky=tk.W, pady=2)
         self.cb_proto = self._combo(f_cat, 3, "Protokoll:", list(CAT_PROTOCOLS), str(cfg.get("CAT_PROTOCOL", "ICOM")))
+        self.cb_proto.bind("<<ComboboxSelected>>", lambda _e: self._show_profile())
 
         # --- TNC / PTT ---------------------------------------------------
         f_ptt = ttk.LabelFrame(outer, text="TNC / PTT", padding=8)
@@ -580,7 +582,11 @@ class SettingsDialog(tk.Toplevel):
 
     def _show_profile(self):
         profile = self.app.profiles.get(self.cb_radio.get())
-        self.lbl_profile.config(text=profile.summary() if profile else "Protokoll / Baudrate unten selbst einstellen")
+        text = profile.summary() if profile else "Protokoll / Baudrate unten selbst einstellen"
+        if profile is not None and profile.is_codan != (self.cb_proto.get().upper() == "CODAN") \
+                and self.cb_ptt.get().upper() != "TNC":
+            text += "\n⚠ Passt nicht zum Protokoll unten – am PC zählt das Protokoll (z.B. ICOM für IC-7300)."
+        self.lbl_profile.config(text=text)
 
     def _apply_radio_model(self):
         """Like HFChat: the radio model fills protocol, CI-V address and baud rate."""
@@ -852,10 +858,9 @@ class SelCallApp(tk.Tk):
         self.txt_log.config(state="disabled")
 
     def _codan_uses_cics(self) -> bool:
-        mode = str(self.cfg.get("CODAN_MODE", "AUTO")).upper()
-        if mode == "CICS":
-            return True
-        if mode == "AUDIO":
+        # CICS only goes to a Codan; "CICS" in the settings cannot force it
+        # onto an Icom (it would get "selcall 435299" as text and do nothing).
+        if str(self.cfg.get("CODAN_MODE", "AUTO")).upper() == "AUDIO":
             return False
         return self.link.is_codan
 
@@ -1023,6 +1028,9 @@ class SelCallApp(tk.Tk):
                     frames = wf.readframes(wf.getnframes())
                 samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
                 self.log(f"TX {label} ({len(samples) / rate:.1f} s)")
+                if (self.link.ptt_method == "CAT" and self.link.cat_protocol.upper() == "ICOM"
+                        and not getattr(self.link, "usb_data_set", False)):
+                    self.link.icom_set_usb_data()      # without DATA the USB audio is not sent
                 if not self.link.set_ptt(True):
                     self.log("FEHLER: PTT konnte nicht geschaltet werden")
                     return
