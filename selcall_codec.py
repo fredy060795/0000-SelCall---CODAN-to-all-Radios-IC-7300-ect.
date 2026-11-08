@@ -328,13 +328,32 @@ class CodanSelcallEncoder:
             )
         return [int(sid[i:i + 2]) for i in range(0, len(sid), 2)]
 
-    def build_words(self, call_id, our_id, fmt=FMT_SELCALL, category=100):
+    # Content after the caller's address (open selcall layout, also understood
+    # by Codan radios in an Open Selcall network)
+    PAGE = 116              # pagecall: 116 + up to 32 text characters
+    STATUS_REQUEST = (103, 103)
+    GPS_REQUEST = (125, 125)
+    PAGE_MAX_CHARS = 32
+    END_SYMBOLS = (117, 122, 127, 119)
+
+    @classmethod
+    def page_content(cls, text):
+        text = str(text or "").upper()
+        if not 1 <= len(text) <= cls.PAGE_MAX_CHARS:
+            raise ValueError(f"Nachricht: 1 bis {cls.PAGE_MAX_CHARS} Zeichen.")
+        bad = sorted({ch for ch in text if not 32 <= ord(ch) < 127})
+        if bad:
+            raise ValueError(f"Nachricht: diese Zeichen gehen nicht: {''.join(bad)} (keine Umlaute)")
+        return [cls.PAGE] + [ord(ch) for ch in text]
+
+    def build_words(self, call_id, our_id, fmt=FMT_SELCALL, category=100, content=()):
         to = self.split_id(call_id, "Call ID")
         frm = self.split_id(our_id, "Our ID")
         if len(to) != len(frm):
             raise ValueError("Call ID and Our ID must both have 4 digits or both have 6 digits.")
-        # Message in DX order: format, called address, category, self ID, EOS x3
-        dx = [fmt] + to + [category] + frm + [self.EOS_ARQ] * 3
+        # Message in DX order: format, called address, category, self ID,
+        # content, EOS x3
+        dx = [fmt] + to + [category] + frm + list(content) + [self.EOS_ARQ] * 3
         # RX copy lags the DX copy by 4 words (time diversity)
         rx = [dx[0], dx[0]] + dx[:-2]
         words = []
@@ -344,13 +363,239 @@ class CodanSelcallEncoder:
             words += [d, r]
         return words
 
-    def build_bits(self, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0):
+    def build_bits(self, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0, content=()):
         n_pre = max(20, int(round(preamble_s * self.BAUD)))
         bits = [i & 1 for i in range(n_pre)]  # dot pattern 0101...
-        for w in self.build_words(call_id, our_id, fmt, category):
+        for w in self.build_words(call_id, our_id, fmt, category, content):
             bits += self.word_bits(w)
         return bits
 
-    def generate(self, audio_gen, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0):
-        bits = self.build_bits(call_id, our_id, fmt, category, preamble_s)
+    def generate(self, audio_gen, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0, content=()):
+        bits = self.build_bits(call_id, our_id, fmt, category, preamble_s, content)
         return audio_gen.generate_fsk(bits, self.BAUD, self.F_ZERO, self.F_ONE)
+
+
+def describe_call(words):
+    """Turn the DX words of a call (format .. end) into a dict, None if not a call."""
+    if len(words) < 6:
+        return None
+    fmt = words[0]
+    if fmt not in (120, 123, 125, 102, 116):
+        return None
+    try:
+        cat_at = next(i for i in range(1, 5) if words[i] is not None and words[i] >= 100)
+    except StopIteration:
+        return None
+    to = words[1:cat_at]
+    n = len(to)
+    if n not in (2, 3) or len(words) < cat_at + 1 + n + 1:
+        return None
+    frm = words[cat_at + 1:cat_at + 1 + n]
+    if any(w is None or w > 99 for w in to + frm):
+        return None
+    rest = [w for w in words[cat_at + 1 + n:]]
+    end = None
+    while rest and (rest[-1] is None or rest[-1] in CodanSelcallEncoder.END_SYMBOLS):
+        if rest[-1] is not None:
+            end = rest[-1]
+        rest.pop()
+    call = {
+        "to": "".join(f"{w:02d}" for w in to),
+        "from": "".join(f"{w:02d}" for w in frm),
+        "category": words[cat_at],
+        "format": fmt,
+        "end": end,
+        "content": rest,
+        "kind": "Selcall",
+        "text": "",
+    }
+    if fmt == 123:
+        call["kind"] = "Kanaltest"
+    elif rest[:1] == [CodanSelcallEncoder.PAGE]:
+        call["kind"] = "Nachricht"
+        call["text"] = "".join(chr(w) if w is not None and 32 <= w < 127 else "?" for w in rest[1:])
+    elif tuple(rest[:2]) == CodanSelcallEncoder.STATUS_REQUEST:
+        call["kind"] = "Status-Abfrage"
+    elif tuple(rest[:2]) == CodanSelcallEncoder.GPS_REQUEST:
+        call["kind"] = "GPS-Abfrage"
+    elif rest[:1] == [121]:
+        call["kind"] = "GPS-Position"
+    elif rest[:1] == [102]:
+        call["kind"] = "Telefonruf"
+    elif rest[:2] == [104, 105]:
+        call["kind"] = "Auflegen"
+    elif rest:
+        call["kind"] = "Ruf mit Daten"
+        call["text"] = " ".join("?" if w is None else str(w) for w in rest)
+    if end == 122:
+        call["kind"] += " (Antwort/Quittung)"
+    return call
+
+
+class CCIR493Decoder:
+    """Receives CODAN / CCIR 493-4 calls from audio (100 Bd FSK 1700/1870 Hz).
+
+    feed() takes float samples; it returns the calls found so far.  The
+    receiver looks for the phasing sequence, then reads every word in the DX
+    position and repairs bad ones from their RX copy four words later.
+    """
+    DECIMATE = 10
+
+    def __init__(self, sample_rate=48000, keep_s=12.0):
+        self.sample_rate = int(sample_rate)
+        self.keep = int(keep_s * sample_rate)
+        self.buffer = np.zeros(0, dtype=np.float32)
+        self.offset = 0              # absolute sample index of buffer[0]
+        self.pending = 0
+        self._last = {}
+
+    def feed(self, samples):
+        samples = np.asarray(samples, dtype=np.float32).ravel()
+        self.buffer = np.concatenate([self.buffer, samples])
+        self.pending += len(samples)
+        calls = []
+        if self.pending >= self.sample_rate // 2:     # look every 0.5 s
+            self.pending = 0
+            calls = self._scan()
+            if len(self.buffer) > self.keep:
+                cut = len(self.buffer) - self.keep
+                self.buffer = self.buffer[cut:]
+                self.offset += cut
+        return calls
+
+    def flush(self):
+        self.pending = 0
+        return self._scan()
+
+    # -- signal -> soft bits
+    def _discriminator(self):
+        x = self.buffer.astype(np.float64)
+        n = np.arange(len(x)) + self.offset
+        win = self.sample_rate // 100
+        out = []
+        for f in (CodanSelcallEncoder.F_ZERO, CodanSelcallEncoder.F_ONE):
+            mixed = x * np.exp(-2j * np.pi * f * n / self.sample_rate)
+            c = np.cumsum(mixed)
+            avg = np.empty_like(c)
+            avg[:win] = c[:win]
+            avg[win:] = c[win:] - c[:-win]
+            out.append(np.abs(avg))
+        a0, a1 = out
+        d = (a1 - a0) / (a1 + a0 + 1e-9)
+        return d[::self.DECIMATE]
+
+    @staticmethod
+    def _words(bits):
+        """value and parity-ok of the 10-bit word starting at every bit."""
+        n = len(bits) - 9
+        if n <= 0:
+            return np.zeros(0, int), np.zeros(0, bool)
+        b = np.lib.stride_tricks.sliding_window_view(bits, 10)[:n]
+        value = (b[:, :7] * (1 << np.arange(7))).sum(axis=1)
+        zeros = 7 - b[:, :7].sum(axis=1)
+        check = b[:, 7] * 4 + b[:, 8] * 2 + b[:, 9]
+        return value, check == zeros
+
+    def _scan(self):
+        d = self._discriminator()
+        spb = self.sample_rate // 100 // self.DECIMATE        # decimated samples per bit (48)
+        best = None
+        for polarity in (1, -1):
+            for off in range(0, spb, 6):
+                soft = polarity * d[off + spb - 1::spb]
+                value, ok = self._words((soft > 0).astype(np.int64))
+                start = self._find_phasing(value, ok)
+                if start is None:
+                    continue
+                result = self._read_call(polarity * d, off + start * spb, spb)
+                if result is None:
+                    continue
+                words, end_pos, quality = result
+                if best is None or quality > best[0]:
+                    best = (quality, words, end_pos * self.DECIMATE)
+        if best is None:
+            return []
+        _, words, end_sample = best
+        found = []
+        call = describe_call(words)
+        if call is not None:
+            key = (call["from"], call["to"], call["kind"], call["text"])
+            t = self.offset + end_sample
+            if t - self._last.get(key, -10 ** 12) > 3 * self.sample_rate:
+                self._last[key] = t
+                found.append(call)
+        cut = min(len(self.buffer), end_sample)       # drop what has been read
+        self.buffer = self.buffer[cut:]
+        self.offset += cut
+        return found
+
+    @staticmethod
+    def _find_phasing(value, ok):
+        """Bit index of the first DX word of a phasing sequence, None if none."""
+        n = len(value)
+        for s in range(0, n - 40):
+            if (ok[s] and value[s] == 125 and ok[s + 20] and value[s + 20] == 125
+                    and ok[s + 10] and ok[s + 30] and 104 <= value[s + 30] < value[s + 10] <= 111
+                    and value[s + 10] - value[s + 30] == 1):
+                return s
+        return None
+
+    @staticmethod
+    def _word_at(d, pos, spb):
+        """(value, ok, margin) of the word whose first bit window ends at pos + spb - 1."""
+        idx = pos + spb - 1 + spb * np.arange(10)
+        if idx[-1] >= len(d) or pos < 0:
+            return None
+        soft = d[idx]
+        bits = (soft > 0).astype(int)
+        value = int((bits[:7] * (1 << np.arange(7))).sum())
+        ok = bits[7] * 4 + bits[8] * 2 + bits[9] == 7 - bits[:7].sum()
+        return value, bool(ok), float(np.min(np.abs(soft)))
+
+    def _track(self, d, pos, spb):
+        """Best word near pos (follows a sound card clock that runs a bit off)."""
+        best = None
+        for shift in (0, -2, 2, -4, 4, -6, 6, -8, 8, -10, 10, -12, 12):
+            word = self._word_at(d, pos + shift, spb)
+            if word is None:
+                return None, 0
+            if word[1] and (best is None or word[2] > best[0][2] + 0.05):
+                best = (word, shift)
+        return (best if best is not None else (self._word_at(d, pos, spb), 0))
+
+    def _read_call(self, d, pos, spb):
+        w = 10 * spb                                  # one word
+        # phasing: walk the DX/RX pairs to the one whose RX is 104
+        for _ in range(9):
+            dx, shift = self._track(d, pos, spb)
+            if dx is None:
+                return None
+            pos += shift
+            rx, rshift = self._track(d, pos + w, spb)
+            if rx is None:
+                return None
+            if not (dx[1] and dx[0] == 125):
+                break                                  # already at the format word
+            pos += 2 * w
+            if rx[1] and rx[0] == 104:
+                break
+        words, quality, end_seen = [], 0, 0
+        for k in range(70):
+            dx, shift = self._track(d, pos, spb)
+            if dx is None:
+                return None                            # call not complete yet
+            pos += shift
+            word = dx[0] if dx[1] else None
+            if word is None:                           # RX copy, 4 words later
+                rx, _ = self._track(d, pos + 4 * w + w, spb)
+                if rx is None:
+                    return None
+                word = rx[0] if rx[1] else None
+            quality += 1 if dx[1] else 0
+            words.append(word)
+            pos += 2 * w
+            if word in CodanSelcallEncoder.END_SYMBOLS and k >= 5:
+                end_seen += 1
+                if end_seen >= 2:
+                    return words, pos, quality
+        return words, pos, quality

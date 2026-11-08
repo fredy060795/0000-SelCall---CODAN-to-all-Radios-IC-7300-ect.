@@ -19,6 +19,32 @@ Wie der Selcall gesendet wird:
         "selcall 435299" + CR am RIG COM Port
     "Kanaltest (Beacon)" sendet "beacon 435299".
 
+FUNKTIONEN IM CODAN-TAB (wie am Envoy)
+--------------------------------------
+  📞 Anpagern (Selcall)   normaler Selcall an die Station
+  ✉ Nachricht senden     SMS/Pagecall, Text im Feld "Nachricht"
+  ❓ Status abfragen      Get Status der Station
+  📍 GPS abfragen         Position der Station anfordern
+  Kanaltest               Beacon / Channel Test
+  Auflegen                (nur Codan per CICS)
+
+  Codan-Funkgerät (CICS):  selcall / pagecall {to} "{msg}" / statuscall /
+                           gpscall / beacon / hangup. Der Codan sendet
+                           selbst; was er zurückmeldet (Antworten,
+                           eingehende Rufe/Nachrichten) erscheint im
+                           "Eingang". Die Befehle sind in den
+                           Einstellungen änderbar.
+  IC-7300 & Co. (Audio):   der PC sendet im offenen Selcall-Format
+                           (Nachricht = 116 + max. 32 Zeichen, Status =
+                           103 103, GPS = 125 125) und hört danach mit:
+                           der RX Decoder erkennt CCIR 493-4 Rufe,
+                           Nachrichten und Antworten und trägt sie in den
+                           "Eingang" ein. Rufe an die eigene ID werden
+                           gelb markiert. Doppelklick übernimmt die
+                           Station als Ziel (zum Antworten).
+  Nachrichten: keine Umlaute (ä ö ü ß), Audio max. 32 Zeichen,
+  CICS max. 64 Zeichen.
+
   Andere Funkgeräte (IC-7300, Yaesu, Kenwood ...):
     Der PC erzeugt das Signal (CCIR 493-4: 100 Baud FSK 1700/1870 Hz,
     bzw. ZVEI/CCIR/DTMF Töne) auf der Soundkarte und schaltet die PTT
@@ -37,6 +63,24 @@ STARTEN
 
 Beim ersten Start öffnen sich die Einstellungen. Eine settings.json der
 alten Version wird übernommen.
+
+AUTOMATISCH EINRICHTEN (empfohlen)
+----------------------------------
+1. Datei → Einstellungen → Funkgerät wählen (z.B. IC-7300 oder CODAN NGT)
+   und PTT Methode (IC-7300: CAT, Codan am Modem: TNC).
+2. "🔍 Automatisch erkennen" klicken. Das Programm
+     - fragt jeden COM Port bei allen Baudraten nach der Frequenz
+       (CI-V / FA; / CICS FREQ) bzw. nach dem Modem-Prompt "cmd:" –
+       es wird dabei NICHT gesendet,
+     - lernt dabei auch die CI-V Adresse,
+     - sucht die Soundkarte, die im selben USB-Gerät steckt wie der
+       COM Port des Funkgeräts (Windows Geräte-Baum), sonst nach Namen
+       ("USB Audio CODEC", "USB PnP Sound Device", ...).
+3. Speichern. Danach "🔊 Testton 2 s (mit PTT)": das Funkgerät muss
+   senden und die ALC/Leistung ausschlagen.
+Vorher HFChat und andere Programme schließen, die die COM Ports benutzen.
+Fehlt beim Start die eingestellte Soundkarte, sucht das Programm sie
+selbst. In der Liste steht jede Soundkarte nur einmal (Windows MME).
 
 EINSTELLUNGEN (Datei → Einstellungen)
 -------------------------------------

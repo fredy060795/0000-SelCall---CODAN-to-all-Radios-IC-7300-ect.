@@ -16,7 +16,7 @@ sys.path.insert(0, ROOT)
 import numpy as np  # noqa: E402
 
 import radio_models  # noqa: E402
-from selcall_codec import AudioGenerator, CodanSelcallEncoder  # noqa: E402
+from selcall_codec import AudioGenerator, CCIR493Decoder, CodanSelcallEncoder, describe_call  # noqa: E402
 
 try:
     import pty
@@ -68,7 +68,8 @@ class CodecTest(unittest.TestCase):
 class FakeDevice:
     """Other end of a pseudo terminal: records lines, answers like a PTC/Codan."""
 
-    def __init__(self, answer):
+    def __init__(self, answer, raw=None):
+        self.raw = raw          # raw(data) -> reply, for binary protocols (CI-V)
         self.master, slave = pty.openpty()
         self.port = os.ttyname(slave)
         self.answer = answer
@@ -85,6 +86,11 @@ class FakeDevice:
             except OSError:
                 return
             self.received += data
+            if self.raw is not None:
+                reply = self.raw(data)
+                if reply:
+                    os.write(self.master, reply)
+                continue
             buf += data
             while b"\r" in buf:
                 line, buf = buf.split(b"\r", 1)
@@ -160,6 +166,147 @@ class RadioLinkTest(unittest.TestCase):
     def test_tnc_without_codan_cannot_key_audio(self):
         link = self.make_link({"RADIO_MODEL": "IC-7300", "PTT_METHOD": "TNC"})
         self.assertIn("nur mit einem Codan", link.can_key_audio())
+
+
+import autodetect  # noqa: E402
+
+# Windows device tree of an IC-7300 on a PC with Realtek sound (synthetic, as
+# Get-PnpDevice reports it).
+TREE = [
+    {"Class": "Ports", "Name": "Silicon Labs CP210x USB to UART Bridge (COM16)",
+     "Id": "USB\\VID_10C4&PID_EA60\\IC-7300 03001234",
+     "Parents": ["USB\\VID_0451&PID_2046\\5&1A2B", "USB\\ROOT_HUB30\\4&ABC", "PCI\\VEN_8086"]},
+    {"Class": "Ports", "Name": "Kommunikationsanschluss (COM1)", "Id": "ACPI\\PNP0501\\0", "Parents": ["ACPI\\X"]},
+    {"Class": "AudioEndpoint", "Name": "Lautsprecher (USB Audio CODEC)",
+     "Id": "SWD\\MMDEVAPI\\{0.0.0.00000000}.{AAA}",
+     "Parents": ["USB\\VID_08BB&PID_2901&MI_00\\6&1", "USB\\VID_08BB&PID_2901\\5&2", "USB\\VID_0451&PID_2046\\5&1A2B",
+                 "USB\\ROOT_HUB30\\4&ABC"]},
+    {"Class": "AudioEndpoint", "Name": "Mikrofon (USB Audio CODEC)",
+     "Id": "SWD\\MMDEVAPI\\{0.0.1.00000000}.{BBB}",
+     "Parents": ["USB\\VID_08BB&PID_2901&MI_00\\6&1", "USB\\VID_08BB&PID_2901\\5&2", "USB\\VID_0451&PID_2046\\5&1A2B",
+                 "USB\\ROOT_HUB30\\4&ABC"]},
+    # a USB headset on the same root hub must not be taken
+    {"Class": "AudioEndpoint", "Name": "Kopfhörer (USB PnP Sound Device)",
+     "Id": "SWD\\MMDEVAPI\\{0.0.0.00000000}.{CCC}",
+     "Parents": ["USB\\VID_0D8C&PID_0014&MI_00\\7", "USB\\VID_0D8C&PID_0014\\6", "USB\\ROOT_HUB30\\4&ABC"]},
+    {"Class": "AudioEndpoint", "Name": "Lautsprecher (Realtek(R) Audio)",
+     "Id": "SWD\\MMDEVAPI\\{0.0.0.00000000}.{DDD}", "Parents": ["HDAUDIO\\FUNC_01", "PCI\\VEN_8086"]},
+]
+OUTPUTS = ["Microsoft Soundmapper - Output", "Lautsprecher (Realtek(R) Audio)", "Kopfhörer (USB PnP Sound Device)",
+           "Lautsprecher (USB Audio CODEC)"]
+INPUTS = ["Microsoft Soundmapper - Input", "Mikrofon (Realtek(R) Audio)", "Mikrofon (USB Audio CODEC)"]
+
+
+class AudioMatchTest(unittest.TestCase):
+    def test_same_usb_device_as_com_port(self):
+        out, inp = autodetect.audio_for_com_port("COM16", TREE)
+        self.assertEqual(out, "Lautsprecher (USB Audio CODEC)")
+        self.assertEqual(inp, "Mikrofon (USB Audio CODEC)")
+        self.assertEqual(autodetect.audio_for_com_port("COM1", TREE), (None, None))
+
+    def test_mme_names_are_cut_to_31_chars(self):
+        names = ["Lautsprecher (2- USB Audio COD"]
+        self.assertEqual(autodetect.match_name("Lautsprecher (2- USB Audio CODEC)", names), names[0])
+
+    def test_guess_by_name(self):
+        self.assertEqual(autodetect.guess_by_name(OUTPUTS), "Lautsprecher (USB Audio CODEC)")
+        self.assertEqual(autodetect.pick_partner(INPUTS, "Lautsprecher (USB Audio CODEC)"),
+                         "Mikrofon (USB Audio CODEC)")
+        self.assertIsNone(autodetect.guess_by_name(["Lautsprecher (Realtek(R) Audio)"]))
+
+
+@unittest.skipIf(pty is None, "needs pty + pyserial")
+class ProbeTest(unittest.TestCase):
+    def test_icom_found_and_address_learned(self):
+        def icom(data):
+            if b"\xe0\x03\xfd" in data:     # read frequency -> IC-7610 (98h) answers
+                return b"\xfe\xfe\xe0\x98\x03\x00\x00\x07\x14\x00\xfd"
+            return None
+        dev = FakeDevice(None, raw=icom)
+        hit = autodetect.probe_rig(dev.port, "ICOM", 0x94, bauds=(115200,))
+        self.assertEqual(hit["address"], 0x98)       # found although 94 was set
+
+    def test_ptc_found(self):
+        def ptc(line):
+            text = line.split(b"\xaa")[-1].strip()
+            return b"DR-7800 V1.2\r\ncmd: " if text == b"VER" else b"\r\ncmd: "
+        dev = FakeDevice(ptc)
+        hit = autodetect.probe_ptc(dev.port, bauds=(57600,))
+        self.assertEqual((hit["baud"], hit["modem"]), (57600, "DR-7800"))
+
+    def test_nothing_answers(self):
+        dev = FakeDevice(lambda line: None)
+        self.assertIsNone(autodetect.probe_rig(dev.port, "YAESU", bauds=(38400,)))
+        self.assertIsNone(autodetect.probe_ptc(dev.port, bauds=(57600,)))
+
+
+def _audio(enc, gen, *args, **kwargs):
+    pcm = bytes(enc.generate(gen, *args, **kwargs))
+    return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _decode(signal):
+    dec, calls = CCIR493Decoder(), []
+    for i in range(0, len(signal), 4800):
+        calls += dec.feed(signal[i:i + 4800])
+    return calls + dec.flush()
+
+
+class CallTypesTest(unittest.TestCase):
+    def setUp(self):
+        self.enc, self.gen = CodanSelcallEncoder(), AudioGenerator()
+
+    def test_page_and_status_and_gps_round_trip(self):
+        rng = np.random.default_rng(3)
+        quiet = lambda n: rng.normal(0, 0.05, n).astype(np.float32)
+        signal = np.concatenate([
+            quiet(20000),
+            _audio(self.enc, self.gen, "435201", "435299", content=self.enc.page_content("Treffpunkt 14:30")),
+            quiet(10000),
+            _audio(self.enc, self.gen, "435201", "435299", content=self.enc.STATUS_REQUEST, preamble_s=1),
+            _audio(self.enc, self.gen, "4352", "4353", content=self.enc.GPS_REQUEST, preamble_s=1),
+            _audio(self.enc, self.gen, "4352", "4353", fmt=123, preamble_s=1),
+            quiet(48000)])
+        signal += rng.normal(0, 0.15, len(signal)).astype(np.float32)
+        calls = [(c["kind"], c["from"], c["to"], c["text"]) for c in _decode(signal)]
+        self.assertEqual(calls, [("Nachricht", "435299", "435201", "TREFFPUNKT 14:30"),
+                                 ("Status-Abfrage", "435299", "435201", ""),
+                                 ("GPS-Abfrage", "4353", "4352", ""),
+                                 ("Kanaltest", "4353", "4352", "")])
+
+    def test_sound_card_clock_off_by_one_percent(self):
+        a = _audio(self.enc, self.gen, "435201", "435299", content=self.enc.page_content("X" * 32))
+        for drift in (1.01, 0.99):
+            x = np.interp(np.arange(0, len(a), drift), np.arange(len(a)), a).astype(np.float32)
+            self.assertEqual([c["text"] for c in _decode(x)], ["X" * 32])
+
+    def test_noise_makes_no_call(self):
+        noise = np.random.default_rng(9).normal(0, 0.3, 48000 * 20).astype(np.float32)
+        self.assertEqual(_decode(noise), [])
+
+    def test_page_limits(self):
+        with self.assertRaises(ValueError):
+            self.enc.page_content("X" * 33)
+        with self.assertRaises(ValueError):
+            self.enc.page_content("Grüße")
+        self.assertEqual(self.enc.page_content("ab"), [116, 65, 66])
+
+    def test_describe_reply(self):
+        call = describe_call([120, 43, 52, 1, 100, 43, 52, 99, 122, 122])
+        self.assertEqual((call["kind"], call["from"], call["to"]), ("Selcall (Antwort/Quittung)", "435299", "435201"))
+
+
+@unittest.skipIf(pty is None, "needs pyserial")
+class CicsCommandTest(unittest.TestCase):
+    def test_commands(self):
+        link = radio_link.RadioLink({"RADIO_MODEL": "CODAN ENVOY"}, lambda t: None, lambda n: None)
+        self.assertEqual(link.codan_command_text("page", "435201", "435299", 'Hallo "Wien"'),
+                         "pagecall 435201 \"Hallo 'Wien'\"")
+        self.assertEqual(link.codan_command_text("status", "435201", "435299"), "statuscall 435201")
+        self.assertEqual(link.codan_command_text("gps", "435201", "435299"), "gpscall 435201")
+        link.cfg["CODAN_SEND_SELF_ID"] = True
+        self.assertEqual(link.codan_command_text("status", "435201", "435299"), "statuscall 435201 from 435299")
+        self.assertEqual(link.codan_command_text("hangup", "", "435299"), "hangup")
 
 
 if __name__ == "__main__":
