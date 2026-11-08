@@ -323,28 +323,59 @@ class RadioLink:
         """The Icom answers a 'read frequency' (03) on CI-V."""
         return self.icom_query(b"\x03", 5, timeout=0.5) is not None
 
+    def _port_is_modem(self) -> bool:
+        """A SCS PACTOR modem answers a CR with 'cmd:' - then this is not the radio."""
+        self.rig.clear_recent()
+        self.rig.write(b"\r")
+        return self.rig.wait_for(lambda t: "CMD:" in t.upper() or "PTC" in t.upper(), 0.6) is not None
+
+    def _icom_try_bauds(self, port: str) -> bool:
+        for baud in self.ICOM_BAUDS:
+            try:
+                self.rig.open(port, baud)
+            except Exception:
+                return False                     # port busy / gone
+            if self.icom_alive():
+                return True
+        return False
+
     def _icom_find_baud(self, port: str) -> str:
-        """Icom does not answer at the set baud rate: try the others and keep the one that works."""
+        """The Icom does not answer: wrong port (e.g. the modem's) or wrong baud rate.
+        Try the other baud rates, then the other COM ports, and keep what works."""
         if self.icom_alive():
             return ""
         first = self.rig.baud
-        self.log(f"IC-7300 antwortet nicht mit {first} Bd – probiere andere Baudraten …")
-        for baud in self.ICOM_BAUDS:
-            if baud == first:
-                continue
-            self.rig.open(port, baud)
-            if self.icom_alive():
-                self.cfg["RIG_BAUD"] = baud
+        if self._port_is_modem():
+            self.log(f"Auf {port} antwortet das PACTOR-Modem, nicht das Funkgerät – suche das IC-7300 "
+                     f"an den anderen COM Ports …")
+        else:
+            self.log(f"IC-7300 antwortet nicht auf {port} mit {first} Bd – probiere andere Baudraten …")
+            if self._icom_try_bauds(port):
+                self.cfg["RIG_BAUD"] = self.rig.baud
                 self.cfg_changed = True
-                self.log(f"IC-7300 antwortet mit {baud} Bd – übernommen. (Steht am Funkgerät 'CI-V USB Port' "
-                         f"auf 'Link to [REMOTE]', gilt die REMOTE-Baudrate. Besser: MENU > SET > Connectors > "
-                         f"CI-V > CI-V USB Port = Unlink from [REMOTE].)")
+                self.log(f"IC-7300 antwortet mit {self.rig.baud} Bd – übernommen. (Steht am Funkgerät "
+                         f"'CI-V USB Port' auf 'Link to [REMOTE]', gilt die REMOTE-Baudrate. Besser: MENU > SET > "
+                         f"Connectors > CI-V > CI-V USB Port = Unlink from [REMOTE].)")
                 return ""
-        self.rig.open(port, first)
-        return (f"Das Funkgerät antwortet auf {port} mit keiner Baudrate (CI-V {self._civ_address():02X}h). "
-                f"Prüfen am IC-7300: MENU > SET > Connectors > CI-V: CI-V Address 94h, "
-                f"CI-V USB Port = Unlink from [REMOTE], CI-V USB Baud Rate 115200. "
-                f"Läuft HFChat/ein anderes CAT-Programm noch?")
+        modem_port = str(self.cfg.get("PTC_SERIAL_PORT", "") or "")
+        for other in list_serial_ports():
+            if other in (port, modem_port):
+                continue
+            self.log(f"Suche IC-7300 an {other} …")
+            if self._icom_try_bauds(other):
+                self.cfg["RIG_SERIAL_PORT"] = other
+                self.cfg["RIG_BAUD"] = self.rig.baud
+                self.cfg_changed = True
+                self.log(f"IC-7300 gefunden: {other} @ {self.rig.baud} Bd – als RIG COM Port übernommen")
+                return ""
+        try:
+            self.rig.open(port, first)
+        except Exception:
+            pass
+        return (f"Das IC-7300 antwortet an keinem COM Port (CI-V {self._civ_address():02X}h). "
+                f"Eingeschaltet und per USB verbunden? Am IC-7300: MENU > SET > Connectors > CI-V: "
+                f"CI-V Address 94h, CI-V USB Port = Unlink from [REMOTE]. Läuft HFChat/ein anderes "
+                f"CAT-Programm auf dem COM Port des Funkgeräts?")
 
     def _ptc_find_baud(self, port: str):
         first = self.ptc.baud

@@ -187,13 +187,32 @@ class RadioLinkTest(unittest.TestCase):
         self.assertTrue(any("Unlink from [REMOTE]" in line for line in self.logs))
         link.disconnect()
 
+    def test_rig_port_set_to_the_modem_finds_the_radio(self):
+        """RIG COM Port points at the PTC-II (COM20); the IC-7300 is on another port (COM16)."""
+        modem = FakeDevice(lambda line: b"\r\ncmd: ")
+        radio = FakeDevice(None, raw=lambda d: (b"\xfe\xfe\xe0\x94\x03\x00\x00\x07\x14\x00\xfd"
+                                                if d.endswith(b"\x03\xfd") else b"\xfe\xfe\xe0\x94\xfb\xfd"))
+        old = radio_link.list_serial_ports
+        radio_link.list_serial_ports = lambda: [modem.port, radio.port]
+        try:
+            link = self.make_link({"RADIO_MODEL": "IC-7300", "PTT_METHOD": "CAT", "CAT_PROTOCOL": "ICOM",
+                                   "RIG_SERIAL_PORT": modem.port, "RIG_BAUD": 9600})
+            self.assertEqual(link.connect(), [])
+        finally:
+            radio_link.list_serial_ports = old
+        self.assertEqual(link.cfg["RIG_SERIAL_PORT"], radio.port)
+        self.assertEqual(link.rig.port, radio.port)
+        self.assertTrue(any("PACTOR-Modem, nicht das Funkgerät" in line for line in self.logs))
+        self.assertTrue(link.set_ptt(True))
+        link.disconnect()
+
     def test_icom_silent_on_every_baud(self):
         dev = FakeDevice(None, raw=lambda d: None)
         link = self.make_link({"RADIO_MODEL": "IC-7300", "PTT_METHOD": "CAT", "CAT_PROTOCOL": "ICOM",
                                "RIG_SERIAL_PORT": dev.port, "RIG_BAUD": 115200})
         problems = link.connect()
         self.assertEqual(len(problems), 1)
-        self.assertIn("mit keiner Baudrate", problems[0])
+        self.assertIn("an keinem COM Port", problems[0])
         self.assertEqual(link.rig.baud, 115200)
         self.assertIn("blocked", link.icom_prepare_audio_tx())
         link.disconnect()

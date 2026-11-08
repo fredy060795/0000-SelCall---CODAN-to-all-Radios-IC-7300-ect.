@@ -623,6 +623,12 @@ class SettingsDialog(tk.Toplevel):
                 self.cb_ptt.set("TNC")
 
     def _save(self):
+        rig, ptc = self.cb_rig_port.get().strip(), self.cb_ptc_port.get().strip()
+        if rig and rig == ptc:
+            messagebox.showerror("Einstellungen", f"RIG COM Port und PTC COM Port sind beide {rig}.\n"
+                                 "Der RIG Port ist das Funkgerät (IC-7300, z.B. COM16), der PTC Port das "
+                                 "PACTOR-Modem.", parent=self)
+            return
         our = self.e_our.get().strip()
         if our and not (our.isdigit() and len(our) in (4, 6)):
             messagebox.showerror("Einstellungen", "Eigene ID: 4 oder 6 Ziffern (z.B. 435299).", parent=self)
