@@ -183,6 +183,48 @@ class RadioLinkTest(unittest.TestCase):
         self.assertEqual(link.icom_set_usb_data(), "")
         link.disconnect()
 
+    def _ic7300_with_menu(self, readable=True):
+        """Fake IC-7300 with mode, DATA and the DATA MOD menu item (1A 05 00 67)."""
+        state = {"mode": b"\x00\x01", "data": b"\x00\x00", "datamod": 0x01, "writes": []}   # LSB, DATA off, ACC
+        ok, ng = b"\xfe\xfe\xe0\x94\xfb\xfd", b"\xfe\xfe\xe0\x94\xfa\xfd"
+
+        def radio(d):
+            frame = d[d.find(b"\x94\xe0") + 2:d.find(b"\xfd")] if b"\x94\xe0" in d else b""
+            if frame == b"\x04":
+                return b"\xfe\xfe\xe0\x94\x04" + state["mode"] + b"\xfd"
+            if frame == b"\x1a\x06":
+                return b"\xfe\xfe\xe0\x94\x1a\x06" + state["data"] + b"\xfd"
+            if frame == b"\x1a\x05\x00\x67":
+                return (b"\xfe\xfe\xe0\x94\x1a\x05\x00\x67" + bytes([state["datamod"]]) + b"\xfd") if readable else ng
+            if frame.startswith(b"\x1a\x05\x00\x67") and len(frame) == 5:
+                state["datamod"] = frame[4]
+                state["writes"].append(frame[4])
+                return ok
+            if frame[:1] == b"\x06" and len(frame) == 3:
+                state["mode"] = frame[1:]
+                return ok
+            if frame[:2] == b"\x1a\x06" and len(frame) == 4:
+                state["data"] = frame[2:]
+                return ok
+            return ok if frame else None
+        dev, link = self._icom(radio)
+        return state, link
+
+    def test_datamod_switched_for_tx_and_restored(self):
+        state, link = self._ic7300_with_menu()
+        saved = link.icom_prepare_audio_tx()
+        self.assertEqual((state["datamod"], state["mode"], state["data"]), (0x03, b"\x01\x01", b"\x01\x01"))
+        link.icom_restore_audio_tx(saved)
+        # PACTOR set-up is back: ACC, LSB, DATA off
+        self.assertEqual((state["datamod"], state["mode"], state["data"]), (0x01, b"\x00\x01", b"\x00\x00"))
+        link.disconnect()
+
+    def test_datamod_not_touched_when_unreadable(self):
+        state, link = self._ic7300_with_menu(readable=False)
+        link.icom_restore_audio_tx(link.icom_prepare_audio_tx())
+        self.assertEqual(state["writes"], [])
+        link.disconnect()
+
     def test_icom_refuses_tx(self):
         dev, link = self._icom(lambda d: b"\xfe\xfe\xe0\x94\xfa\xfd")
         self.assertFalse(link.set_ptt(True))

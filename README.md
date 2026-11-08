@@ -121,7 +121,8 @@ TYPISCHE AUFBAUTEN
      PTT Methode = CAT, Audio Ausgang = "USB Audio CODEC"
    Am IC-7300:
      - Betriebsart USB-D (DATA-Taste)
-     - MENU > SET > Connectors > MOD Input > DATA MOD = USB
+     - DATA MOD: stellt SelCall selbst kurz auf USB (siehe unten),
+       am Gerät auf ACC lassen, wenn ein PACTOR-Modem an ACC hängt
      - USB MOD Level ca. 50 % (ALC kaum Ausschlag), 10-30 W
      - CI-V Address 94h, CI-V USB Baud Rate 115200 (oder Auto)
 
@@ -171,6 +172,18 @@ am Funkgerät ankommt.
 - IC-7300 per USB anschließen und EINSCHALTEN, bevor das Programm startet
   (sonst gibt es den "USB Audio CODEC" nicht). Treiber: Icom USB Driver.
 - "Alle Audiogeräte ins Protokoll" drücken und die Liste schicken.
+
+IC-7300 MIT PACTOR-MODEM AN ACC (DATA MOD)
+------------------------------------------
+DATA MOD am IC-7300 kann nur EINE Quelle haben: ACC (PACTOR-Modem) oder USB
+(SelCall vom PC). Darum: am Funkgerät DATA MOD auf ACC lassen.
+SelCall stellt vor jedem Ruf über CI-V um (Menü 1A 05 00 67):
+  DATA MOD → USB, Betriebsart → USB-D
+und danach wieder zurück auf genau das, was vorher eingestellt war
+(z.B. ACC, USB, DATA aus). Im Protokoll steht "DATA MOD ACC → USB (nur für
+diesen Ruf)" und "DATA MOD zurück auf ACC".
+Abschaltbar in Einstellungen → CAT / RIG. IC-7300MK2: Menü-Nr. 0085.
+Kann DATA MOD nicht gelesen werden, fasst das Programm das Menü nicht an.
 
 CODAN SELCALL VOM PC (Audio, CCIR 493-4)
 ----------------------------------------

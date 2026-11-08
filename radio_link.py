@@ -504,6 +504,73 @@ class RadioLink:
         self.usb_data_set = replies[1] == "OK"
         return "" if replies == ["OK", "OK"] else f"Mode USB {replies[0]}, DATA {replies[1]}"
 
+    # IC-7300 menu over CI-V (1A 05 00 nn): 0067 = DATA MOD, 0066 = DATA OFF MOD,
+    # values 00 MIC, 01 ACC, 02 MIC,ACC, 03 USB, 04 MIC,USB.  The IC-7300MK2 uses 0085.
+    MOD_NAMES = {0: "MIC", 1: "ACC", 2: "MIC,ACC", 3: "USB", 4: "MIC,USB", 5: "LAN"}
+
+    def _icom_ack(self, payload: bytes, timeout: float = 1.0) -> Optional[bool]:
+        """Write a CI-V command; True = FB, False = FA, None = no answer."""
+        addr = self._civ_address()
+        self.rig.clear_recent()
+        self.rig.write(b"\xFE\xFE" + bytes([addr, 0xE0]) + payload + b"\xFD")
+        reply = self.rig.wait_for(lambda t: f"E0 {addr:02X} FB FD" in t or f"E0 {addr:02X} FA FD" in t, timeout)
+        if reply is None:
+            return None
+        return f"E0 {addr:02X} FB FD" in reply
+
+    def _datamod_item(self) -> bytes:
+        raw = str(self.cfg.get("ICOM_DATAMOD_ITEM", "0067") or "0067").strip()
+        raw = (raw if len(raw) == 4 and raw.isdigit() else "0067")
+        return bytes([int(raw[:2], 16), int(raw[2:], 16)])
+
+    def icom_prepare_audio_tx(self) -> Optional[dict]:
+        """Before audio TX: USB-D and DATA MOD = USB.  Remembers what was set before,
+        so the PACTOR modem (ACC) works again after icom_restore_audio_tx()."""
+        if not self.rig.is_open or self.ptt_method != "CAT" or self.cat_protocol.upper() != "ICOM":
+            return None
+        state = {}
+        mode = self.icom_query(b"\x04", 2)                    # mode, filter
+        data = self.icom_query(b"\x1A\x06", 2)                # data on/off, filter
+        if mode is not None:
+            state["mode"] = mode
+        if data is not None:
+            state["data"] = data
+        if self.cfg.get("ICOM_DATAMOD_SWITCH", True):
+            item = self._datamod_item()
+            current = self.icom_query(b"\x1A\x05" + item, 1)
+            if current is None or current[0] not in self.MOD_NAMES:
+                self.log("DATA MOD konnte nicht gelesen werden – Menü bleibt unverändert "
+                         "(am IC-7300 DATA MOD selbst auf USB stellen)")
+            elif current[0] in (3, 4):
+                pass                                            # already USB / MIC,USB
+            else:
+                ok = self._icom_ack(b"\x1A\x05" + item + b"\x03")
+                if ok:
+                    state["datamod"] = current[0]
+                    self.log(f"DATA MOD {self.MOD_NAMES[current[0]]} → USB (nur für diesen Ruf)")
+                else:
+                    self.log("DATA MOD konnte nicht auf USB gestellt werden")
+        need_mode = mode is None or mode[0] != 0x01
+        need_data = data is None or data[0] != 0x01
+        if need_mode:
+            self._icom_ack(b"\x06\x01\x01")                  # USB
+        if need_data:
+            self._icom_ack(b"\x1A\x06\x01\x01")             # DATA on
+        return state
+
+    def icom_restore_audio_tx(self, state: Optional[dict]):
+        """Put DATA MOD, mode and DATA back as they were (PACTOR via ACC works again)."""
+        if not state or not self.rig.is_open:
+            return
+        if "datamod" in state:
+            ok = self._icom_ack(b"\x1A\x05" + self._datamod_item() + bytes([state["datamod"]]))
+            self.log(f"DATA MOD zurück auf {self.MOD_NAMES.get(state['datamod'], state['datamod'])}"
+                     + ("" if ok else " – FEHLGESCHLAGEN, bitte am Funkgerät prüfen"))
+        if "mode" in state:
+            self._icom_ack(b"\x06" + state["mode"])
+        if "data" in state:
+            self._icom_ack(b"\x1A\x06" + state["data"])
+
     def _icom_ptt(self, active: bool, frame: bytes) -> bool:
         """CI-V PTT with the radio's answer: FB = done, FA = refused, nothing = no link."""
         addr = f"{self._civ_address():02X}"
