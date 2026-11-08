@@ -183,9 +183,10 @@ class RadioLinkTest(unittest.TestCase):
         self.assertEqual(link.icom_set_usb_data(), "")
         link.disconnect()
 
-    def _ic7300_with_menu(self, readable=True):
-        """Fake IC-7300 with mode, DATA and the DATA MOD menu item (1A 05 00 67)."""
-        state = {"mode": b"\x00\x01", "data": b"\x00\x00", "datamod": 0x01, "writes": []}   # LSB, DATA off, ACC
+    def _ic7300_with_menu(self, off_mod=4, data_mod=1, readable=True):
+        """Fake IC-7300: in USB-D like PACTOR uses it, DATA OFF MOD / DATA MOD menu 0066 / 0067."""
+        state = {"mode": b"\x01\x01", "data": b"\x01\x01", "menu_writes": []}
+        menu = {0x66: off_mod, 0x67: data_mod}
         ok, ng = b"\xfe\xfe\xe0\x94\xfb\xfd", b"\xfe\xfe\xe0\x94\xfa\xfd"
 
         def radio(d):
@@ -194,11 +195,12 @@ class RadioLinkTest(unittest.TestCase):
                 return b"\xfe\xfe\xe0\x94\x04" + state["mode"] + b"\xfd"
             if frame == b"\x1a\x06":
                 return b"\xfe\xfe\xe0\x94\x1a\x06" + state["data"] + b"\xfd"
-            if frame == b"\x1a\x05\x00\x67":
-                return (b"\xfe\xfe\xe0\x94\x1a\x05\x00\x67" + bytes([state["datamod"]]) + b"\xfd") if readable else ng
-            if frame.startswith(b"\x1a\x05\x00\x67") and len(frame) == 5:
-                state["datamod"] = frame[4]
-                state["writes"].append(frame[4])
+            if frame[:3] == b"\x1a\x05\x00" and len(frame) == 4:
+                if not readable:
+                    return ng
+                return b"\xfe\xfe\xe0\x94" + frame + bytes([menu[frame[3]]]) + b"\xfd"
+            if frame[:3] == b"\x1a\x05\x00" and len(frame) == 5:
+                state["menu_writes"].append(frame)
                 return ok
             if frame[:1] == b"\x06" and len(frame) == 3:
                 state["mode"] = frame[1:]
@@ -210,19 +212,29 @@ class RadioLinkTest(unittest.TestCase):
         dev, link = self._icom(radio)
         return state, link
 
-    def test_datamod_switched_for_tx_and_restored(self):
-        state, link = self._ic7300_with_menu()
+    def test_pactor_on_acc_selcall_in_plain_usb(self):
+        """DATA OFF MOD = MIC,USB, DATA MOD = ACC: selcall in USB, PACTOR's USB-D comes back."""
+        state, link = self._ic7300_with_menu(off_mod=4, data_mod=1)
         saved = link.icom_prepare_audio_tx()
-        self.assertEqual((state["datamod"], state["mode"], state["data"]), (0x03, b"\x01\x01", b"\x01\x01"))
+        self.assertNotIn("blocked", saved)
+        self.assertEqual(state["data"], b"\x00\x00")             # DATA off -> source DATA OFF MOD (USB)
         link.icom_restore_audio_tx(saved)
-        # PACTOR set-up is back: ACC, LSB, DATA off
-        self.assertEqual((state["datamod"], state["mode"], state["data"]), (0x01, b"\x00\x01", b"\x00\x00"))
+        self.assertEqual((state["mode"], state["data"]), (b"\x01\x01", b"\x01\x01"))   # USB-D again
+        self.assertEqual(state["menu_writes"], [])                 # menu never touched
         link.disconnect()
 
-    def test_datamod_not_touched_when_unreadable(self):
-        state, link = self._ic7300_with_menu(readable=False)
+    def test_usb_on_data_mod_uses_usb_d(self):
+        state, link = self._ic7300_with_menu(off_mod=0, data_mod=3)
         link.icom_restore_audio_tx(link.icom_prepare_audio_tx())
-        self.assertEqual(state["writes"], [])
+        self.assertEqual(state["data"], b"\x01\x01")
+        self.assertEqual(state["menu_writes"], [])
+        link.disconnect()
+
+    def test_no_usb_source_blocks_with_instruction(self):
+        state, link = self._ic7300_with_menu(off_mod=2, data_mod=1)      # MIC,ACC / ACC
+        saved = link.icom_prepare_audio_tx()
+        self.assertIn("DATA OFF MOD = MIC,USB", saved["blocked"])
+        self.assertEqual(state["menu_writes"], [])
         link.disconnect()
 
     def test_icom_refuses_tx(self):

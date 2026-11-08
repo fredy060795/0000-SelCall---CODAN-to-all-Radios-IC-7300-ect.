@@ -59,9 +59,10 @@ DEFAULT_CONFIG = {
     "CODAN_SEND_SELF_ID": False,
     "CODAN_PREAMBLE_S": 2.0,
     "AUTO_CONNECT": True,
-    # IC-7300: DATA MOD only for the selcall on USB, afterwards back (e.g. ACC
-    # for a PACTOR modem).  Menu item 0067 (IC-7300MK2: 0085).
-    "ICOM_DATAMOD_SWITCH": True,
+    # IC-7300: in which mode the selcall goes out.  AUTO reads DATA OFF MOD /
+    # DATA MOD (menu 0066/0067, IC-7300MK2 0084/0085) and takes the one that
+    # has USB as source - the menu itself is never changed.
+    "ICOM_TX_SOURCE": "AUTO",
     "ICOM_DATAMOD_ITEM": "0067",
 }
 
@@ -328,9 +329,12 @@ class SettingsDialog(tk.Toplevel):
         self.e_civ.grid(row=2, column=1, sticky=tk.W, pady=2)
         self.cb_proto = self._combo(f_cat, 3, "Protokoll:", list(CAT_PROTOCOLS), str(cfg.get("CAT_PROTOCOL", "ICOM")))
         self.cb_proto.bind("<<ComboboxSelected>>", lambda _e: self._show_profile())
-        self.v_datamod = tk.BooleanVar(value=bool(cfg.get("ICOM_DATAMOD_SWITCH", True)))
-        ttk.Checkbutton(f_cat, text="Icom: DATA MOD nur zum Senden auf USB, danach zurück (z.B. ACC für PACTOR)",
-                        variable=self.v_datamod).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+        self.cb_txsrc = self._combo(f_cat, 4, "Icom Selcall in:", ["AUTO", "USB", "USB-D"],
+                                    str(cfg.get("ICOM_TX_SOURCE", "AUTO")))
+        ttk.Label(f_cat, foreground="gray", justify=tk.LEFT, text=(
+            "Mit PACTOR-Modem an ACC: am IC-7300 einmalig DATA OFF MOD = MIC,USB,\n"
+            "DATA MOD = ACC lassen. Selcall geht dann in USB raus, PACTOR in USB-D.")).grid(
+            row=6, column=0, columnspan=3, sticky=tk.W)
         ttk.Label(f_cat, text="Menü-Nr. DATA MOD:").grid(row=5, column=0, sticky=tk.W, pady=2)
         self.e_datamod = ttk.Entry(f_cat, width=6)
         self.e_datamod.insert(0, str(cfg.get("ICOM_DATAMOD_ITEM", "0067")))
@@ -443,7 +447,7 @@ class SettingsDialog(tk.Toplevel):
             "PTT_DELAY_MS": delay,
             "AUDIO_OUT": self.cb_out.get(),
             "AUDIO_IN": self.cb_in.get(),
-            "ICOM_DATAMOD_SWITCH": bool(self.v_datamod.get()),
+            "ICOM_TX_SOURCE": self.cb_txsrc.get(),
             "ICOM_DATAMOD_ITEM": (self.e_datamod.get().strip() or "0067"),
         }
 
@@ -1046,7 +1050,11 @@ class SelCallApp(tk.Tk):
                     frames = wf.readframes(wf.getnframes())
                 samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
                 self.log(f"TX {label} ({len(samples) / rate:.1f} s)")
-                icom_state = self.link.icom_prepare_audio_tx()   # USB-D + DATA MOD USB, restored below
+                icom_state = self.link.icom_prepare_audio_tx()   # USB or USB-D, restored below
+                if icom_state and icom_state.get("blocked"):
+                    self.log("NICHT gesendet: " + icom_state["blocked"].replace("\n", " "))
+                    self.after(0, lambda: messagebox.showwarning("IC-7300 Einstellung", icom_state["blocked"]))
+                    return
                 if not self.link.set_ptt(True):
                     self.log("FEHLER: PTT konnte nicht geschaltet werden")
                     return
@@ -1111,8 +1119,11 @@ class SelCallApp(tk.Tk):
         def _work():
             results = []
             with self.tx_lock:
-                icom_state = self.link.icom_prepare_audio_tx()     # USB-D + DATA MOD USB for the test
+                icom_state = self.link.icom_prepare_audio_tx()     # USB or USB-D for the test
                 try:
+                    if icom_state and icom_state.get("blocked"):
+                        self.after(0, lambda: messagebox.showwarning("IC-7300 Einstellung", icom_state["blocked"]))
+                        return
                     self._send_test_loop(candidates, tone, rate, results)
                 finally:
                     self.link.icom_restore_audio_tx(icom_state)   # back to e.g. ACC for the PACTOR modem

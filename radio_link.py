@@ -518,14 +518,38 @@ class RadioLink:
             return None
         return f"E0 {addr:02X} FB FD" in reply
 
-    def _datamod_item(self) -> bytes:
-        raw = str(self.cfg.get("ICOM_DATAMOD_ITEM", "0067") or "0067").strip()
-        raw = (raw if len(raw) == 4 and raw.isdigit() else "0067")
+    def _menu_item(self, key: str, default: str) -> bytes:
+        raw = str(self.cfg.get(key, default) or default).strip()
+        raw = raw if len(raw) == 4 and raw.isdigit() else default
         return bytes([int(raw[:2], 16), int(raw[2:], 16)])
 
+    def _datamod_item(self) -> bytes:
+        return self._menu_item("ICOM_DATAMOD_ITEM", "0067")
+
+    def _dataoffmod_item(self) -> bytes:
+        # DATA OFF MOD is the item before DATA MOD (IC-7300 0066, IC-7300MK2 0084)
+        dm = self._datamod_item()
+        n = int(f"{dm[0]:02X}{dm[1]:02X}") - 1
+        return self._menu_item("ICOM_DATAOFFMOD_ITEM", f"{n:04d}")
+
+    def icom_read_mod_sources(self) -> tuple:
+        """(DATA OFF MOD, DATA MOD) as numbers, None where not readable.  Only reads."""
+        def read(item):
+            value = self.icom_query(b"\x1A\x05" + item, 1)
+            return value[0] if value is not None and value[0] in self.MOD_NAMES else None
+        return read(self._dataoffmod_item()), read(self._datamod_item())
+
     def icom_prepare_audio_tx(self) -> Optional[dict]:
-        """Before audio TX: USB-D and DATA MOD = USB.  Remembers what was set before,
-        so the PACTOR modem (ACC) works again after icom_restore_audio_tx()."""
+        """Before audio TX: pick the mode whose audio source is USB, without
+        touching the menu.
+
+        The IC-7300 has two settings: DATA MOD (for USB-D, e.g. ACC for the
+        PACTOR modem) and DATA OFF MOD (for plain USB).  With DATA OFF MOD =
+        MIC,USB the selcall goes out in plain USB from the PC while PACTOR
+        keeps ACC in USB-D.  Mode and DATA are put back afterwards.
+        Returns None when nothing is to be done, {"blocked": text} when no mode
+        takes audio from USB.
+        """
         if not self.rig.is_open or self.ptt_method != "CAT" or self.cat_protocol.upper() != "ICOM":
             return None
         state = {}
@@ -535,37 +559,43 @@ class RadioLink:
             state["mode"] = mode
         if data is not None:
             state["data"] = data
-        if self.cfg.get("ICOM_DATAMOD_SWITCH", True):
-            item = self._datamod_item()
-            current = self.icom_query(b"\x1A\x05" + item, 1)
-            if current is None or current[0] not in self.MOD_NAMES:
-                self.log("DATA MOD konnte nicht gelesen werden – Menü bleibt unverändert "
-                         "(am IC-7300 DATA MOD selbst auf USB stellen)")
-            elif current[0] in (3, 4):
-                pass                                            # already USB / MIC,USB
-            else:
-                ok = self._icom_ack(b"\x1A\x05" + item + b"\x03")
-                if ok:
-                    state["datamod"] = current[0]
-                    self.log(f"DATA MOD {self.MOD_NAMES[current[0]]} → USB (nur für diesen Ruf)")
-                else:
-                    self.log("DATA MOD konnte nicht auf USB gestellt werden")
-        need_mode = mode is None or mode[0] != 0x01
-        need_data = data is None or data[0] != 0x01
-        if need_mode:
+        choice = str(self.cfg.get("ICOM_TX_SOURCE", "AUTO") or "AUTO").upper()
+        off_mod, data_mod = self.icom_read_mod_sources()
+        names = self.MOD_NAMES
+        self.log(f"IC-7300 Tonquelle: USB → {names.get(off_mod, '?')} · USB-D → {names.get(data_mod, '?')}")
+        usb = (3, 4)
+        if choice == "USB":
+            use_data = False
+        elif choice == "USB-D":
+            use_data = True
+        elif off_mod in usb:
+            use_data = False          # plain USB takes the PC sound: PACTOR (USB-D/ACC) untouched
+        elif data_mod in usb:
+            use_data = True
+        elif off_mod is None and data_mod is None:
+            use_data = True           # menu not readable: old behaviour
+            self.log("Tonquelle nicht lesbar – sende in USB-D")
+        else:
+            state["blocked"] = (
+                f"Am IC-7300 nimmt weder USB ({names.get(off_mod, '?')}) noch USB-D "
+                f"({names.get(data_mod, '?')}) den Ton vom PC.\n\nEinmalig einstellen:\n"
+                "MENU > SET > Connectors > MOD Input > DATA OFF MOD = MIC,USB\n\n"
+                "DATA MOD bleibt auf ACC – PACTOR läuft weiter in USB-D, das Mikrofon geht weiter.")
+            return state
+        if mode is None or mode[0] != 0x01:
             self._icom_ack(b"\x06\x01\x01")                  # USB
-        if need_data:
-            self._icom_ack(b"\x1A\x06\x01\x01")             # DATA on
+        want = b"\x01\x01" if use_data else b"\x00\x00"
+        if data is None or (data[0] != 0) != use_data:
+            ok = self._icom_ack(b"\x1A\x06" + want)
+            if ok is False and not use_data:
+                self._icom_ack(b"\x1A\x06\x00")
+        self.log(f"Selcall sendet in {'USB-D' if use_data else 'USB (DATA aus)'} – Menü unverändert")
         return state
 
     def icom_restore_audio_tx(self, state: Optional[dict]):
-        """Put DATA MOD, mode and DATA back as they were (PACTOR via ACC works again)."""
+        """Put mode and DATA back as they were (PACTOR set-up)."""
         if not state or not self.rig.is_open:
             return
-        if "datamod" in state:
-            ok = self._icom_ack(b"\x1A\x05" + self._datamod_item() + bytes([state["datamod"]]))
-            self.log(f"DATA MOD zurück auf {self.MOD_NAMES.get(state['datamod'], state['datamod'])}"
-                     + ("" if ok else " – FEHLGESCHLAGEN, bitte am Funkgerät prüfen"))
         if "mode" in state:
             self._icom_ack(b"\x06" + state["mode"])
         if "data" in state:
