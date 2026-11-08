@@ -59,6 +59,10 @@ DEFAULT_CONFIG = {
     "CODAN_SEND_SELF_ID": False,
     "CODAN_PREAMBLE_S": 2.0,
     "AUTO_CONNECT": True,
+    # IC-7300: DATA MOD only for the selcall on USB, afterwards back (e.g. ACC
+    # for a PACTOR modem).  Menu item 0067 (IC-7300MK2: 0085).
+    "ICOM_DATAMOD_SWITCH": True,
+    "ICOM_DATAMOD_ITEM": "0067",
 }
 
 # settings.json of the old version (lower case keys)
@@ -324,6 +328,15 @@ class SettingsDialog(tk.Toplevel):
         self.e_civ.grid(row=2, column=1, sticky=tk.W, pady=2)
         self.cb_proto = self._combo(f_cat, 3, "Protokoll:", list(CAT_PROTOCOLS), str(cfg.get("CAT_PROTOCOL", "ICOM")))
         self.cb_proto.bind("<<ComboboxSelected>>", lambda _e: self._show_profile())
+        self.v_datamod = tk.BooleanVar(value=bool(cfg.get("ICOM_DATAMOD_SWITCH", True)))
+        ttk.Checkbutton(f_cat, text="Icom: DATA MOD nur zum Senden auf USB, danach zurück (z.B. ACC für PACTOR)",
+                        variable=self.v_datamod).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+        ttk.Label(f_cat, text="Menü-Nr. DATA MOD:").grid(row=5, column=0, sticky=tk.W, pady=2)
+        self.e_datamod = ttk.Entry(f_cat, width=6)
+        self.e_datamod.insert(0, str(cfg.get("ICOM_DATAMOD_ITEM", "0067")))
+        self.e_datamod.grid(row=5, column=1, sticky=tk.W, pady=2)
+        ttk.Label(f_cat, text="IC-7300: 0067 · IC-7300MK2: 0085", foreground="gray").grid(
+            row=5, column=2, sticky=tk.W)
 
         # --- TNC / PTT ---------------------------------------------------
         f_ptt = ttk.LabelFrame(outer, text="TNC / PTT", padding=8)
@@ -430,6 +443,8 @@ class SettingsDialog(tk.Toplevel):
             "PTT_DELAY_MS": delay,
             "AUDIO_OUT": self.cb_out.get(),
             "AUDIO_IN": self.cb_in.get(),
+            "ICOM_DATAMOD_SWITCH": bool(self.v_datamod.get()),
+            "ICOM_DATAMOD_ITEM": (self.e_datamod.get().strip() or "0067"),
         }
 
     def _apply_found(self, found: dict):
@@ -1019,7 +1034,10 @@ class SelCallApp(tk.Tk):
             return
         rx_running = self.decoder_engine.is_running
 
+        icom_state = None
+
         def _play():
+            nonlocal icom_state
             try:
                 if rx_running:
                     self.decoder_engine.stop()
@@ -1028,9 +1046,7 @@ class SelCallApp(tk.Tk):
                     frames = wf.readframes(wf.getnframes())
                 samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
                 self.log(f"TX {label} ({len(samples) / rate:.1f} s)")
-                if (self.link.ptt_method == "CAT" and self.link.cat_protocol.upper() == "ICOM"
-                        and not getattr(self.link, "usb_data_set", False)):
-                    self.link.icom_set_usb_data()      # without DATA the USB audio is not sent
+                icom_state = self.link.icom_prepare_audio_tx()   # USB-D + DATA MOD USB, restored below
                 if not self.link.set_ptt(True):
                     self.log("FEHLER: PTT konnte nicht geschaltet werden")
                     return
@@ -1044,6 +1060,7 @@ class SelCallApp(tk.Tk):
                 time.sleep(0.15)
             finally:
                 self.link.set_ptt(False)
+                self.link.icom_restore_audio_tx(icom_state)
                 if rx_running or (listen_after and self.cfg.get("AUDIO_IN")):
                     self.after(0, self.start_rx_engine)
                 self.tx_lock.release()
@@ -1054,14 +1071,14 @@ class SelCallApp(tk.Tk):
         """Icom: read ALC/Po during TX - shows at once whether the tone reaches the radio."""
         if self.link.ptt_method != "CAT" or self.link.cat_protocol.upper() != "ICOM" or duration < 0.8:
             return
-        time.sleep(0.5)
-        po, alc = self.link.icom_meter("PO"), self.link.icom_meter("ALC")
+        time.sleep(0.3)
+        po, alc = self.link.icom_meters_max(min(2.0, duration - 0.5))
         if po is None and alc is None:
             return
-        self.log(f"Während TX: Leistung {po} / ALC {alc} (0–255)")
+        self.log(f"Während TX: Leistung max {po} / ALC max {alc} (0–255)")
         if not po and not alc:
-            self.log("WARNUNG: kein Ton am Funkgerät (Leistung 0) – falsche Soundkarte, oder am IC-7300 "
-                     "nicht USB-D / DATA MOD ≠ USB / USB MOD Level 0 %")
+            self.log("WARNUNG: kein Ton am Funkgerät (Leistung 0) – falsche Soundkarte, Windows-Lautstärke "
+                     "der Soundkarte stumm/0, oder am IC-7300 nicht USB-D / DATA MOD ≠ USB / USB MOD Level 0 %")
 
     def find_radio_soundcard(self, done=None):
         """Icom with CAT: key up, play a tone on each sound card, read the power.
@@ -1083,68 +1100,73 @@ class SelCallApp(tk.Tk):
             messagebox.showerror("Sendetest", "Keine Soundkarten gefunden (py -m pip install sounddevice?).")
             return
         if not messagebox.askyesno("Sendetest", (
-                f"Das Funkgerät sendet jetzt bis zu {len(candidates)}× kurz (je 1 s, 1000 Hz).\n"
+                f"Das Funkgerät sendet jetzt bis zu {len(candidates)}× kurz (je 2,5 s, 1000 Hz).\n"
                 "Antenne/Dummy Load anschließen, wenig Leistung, freie Frequenz im Amateurband.\n"
                 "Am PC kann es dabei kurz piepen (das sind die falschen Soundkarten).\n\nStarten?")):
             return
-        if self.link.icom_set_usb_data():
-            self.log("Hinweis: USB-D konnte nicht gesetzt werden – am Funkgerät DATA-Taste drücken")
-        tone = np.frombuffer(bytes(self.audio_gen.generate_sine_wave(1000, 1000, amplitude=0.4)),
+        tone = np.frombuffer(bytes(self.audio_gen.generate_sine_wave(1000, 2500, amplitude=0.4)),
                              dtype="<i2").astype(np.float32) / 32768.0
         rate = self.audio_gen.sample_rate
 
         def _work():
             results = []
             with self.tx_lock:
-                for name in candidates:
-                    idx = audio_device_index(name, "out")
-                    if idx is None:
-                        continue
-                    if not self.link.set_ptt(True):
-                        self.log("Sendetest abgebrochen: PTT geht nicht (siehe oben)")
-                        break
-                    best = 0
-                    try:
-                        time.sleep(0.25)
-                        sd.play(tone, samplerate=rate, device=idx)
-                        for _ in range(3):
-                            time.sleep(0.2)
-                            best = max(best, self.link.icom_meter("PO") or 0, self.link.icom_meter("ALC") or 0)
-                        sd.wait()
-                    except Exception as exc:
-                        self.log(f"Sendetest {name}: {exc}")
-                    finally:
-                        self.link.set_ptt(False)
-                    self.log(f"Sendetest {name}: Leistung/ALC {best}")
-                    results.append((best, name))
-                    time.sleep(0.4)
-            results.sort(reverse=True)
-            winner = results[0][1] if results and results[0][0] > 0 else None
-
-            def _finish():
-                if winner is None:
-                    messagebox.showwarning("Sendetest", (
-                        "Bei keiner Soundkarte kam Leistung heraus.\n\nAm IC-7300 prüfen:\n"
-                        "• Betriebsart USB-D (DATA-Taste)\n"
-                        "• MENU > SET > Connectors > MOD Input > DATA MOD = USB\n"
-                        "• MENU > SET > Connectors > USB MOD Level nicht 0 %\n"
-                        "• Icom USB-Treiber installiert, Funkgerät war beim PC-Start eingeschaltet"))
-                    return
-                inputs = audio_devices("in")
-                self.cfg["AUDIO_OUT"] = winner
-                partner = autodetect.pick_partner(inputs, winner)
-                if partner:
-                    self.cfg["AUDIO_IN"] = partner
+                icom_state = self.link.icom_prepare_audio_tx()     # USB-D + DATA MOD USB for the test
                 try:
-                    save_config(self.cfg)
-                except OSError:
-                    pass
-                self.log(f"Funkgeräte-Soundkarte gefunden und gespeichert: {winner}")
-                messagebox.showinfo("Sendetest", f"Soundkarte des Funkgeräts:\n{winner}\n\nGespeichert.")
-                if done:
-                    done(winner, partner)
-            self.after(0, _finish)
+                    self._send_test_loop(candidates, tone, rate, results)
+                finally:
+                    self.link.icom_restore_audio_tx(icom_state)   # back to e.g. ACC for the PACTOR modem
+            self.after(0, lambda: self._send_test_done(results, done))
         threading.Thread(target=_work, daemon=True).start()
+
+    def _send_test_loop(self, candidates, tone, rate, results):
+        for name in candidates:
+            idx = audio_device_index(name, "out")
+            if idx is None:
+                continue
+            if not self.link.set_ptt(True):
+                self.log("Sendetest abgebrochen: PTT geht nicht (siehe oben)")
+                break
+            po = alc = None
+            try:
+                time.sleep(0.25)
+                sd.play(tone, samplerate=rate, device=idx)
+                time.sleep(0.3)                          # Windows needs a moment to start the sound
+                po, alc = self.link.icom_meters_max(1.8)  # measure over the whole tone
+                sd.wait()
+            except Exception as exc:
+                self.log(f"Sendetest {name}: {exc}")
+            finally:
+                self.link.set_ptt(False)
+            self.log(f"Sendetest {name}: Leistung max {po} / ALC max {alc}")
+            results.append((max(po or 0, alc or 0), name))
+            time.sleep(0.4)
+
+    def _send_test_done(self, results, done):
+        results.sort(reverse=True)
+        winner = results[0][1] if results and results[0][0] > 0 else None
+        if winner is None:
+            messagebox.showwarning("Sendetest", (
+                "Bei keiner Soundkarte kam Leistung heraus.\n\n"
+                "Windows: Sound-Einstellungen → 'Lautsprecher (USB Audio CODEC)' → Lautstärke nicht 0, "
+                "nicht stumm\n\nAm IC-7300 prüfen:\n"
+                "• MENU > SET > Connectors > USB MOD Level nicht 0 %\n"
+                "• Icom USB-Treiber installiert, Funkgerät war beim PC-Start eingeschaltet\n"
+                "• Protokoll: konnte DATA MOD umgeschaltet werden?"))
+            return
+        inputs = audio_devices("in")
+        self.cfg["AUDIO_OUT"] = winner
+        partner = autodetect.pick_partner(inputs, winner)
+        if partner:
+            self.cfg["AUDIO_IN"] = partner
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+        self.log(f"Funkgeräte-Soundkarte gefunden und gespeichert: {winner}")
+        messagebox.showinfo("Sendetest", f"Soundkarte des Funkgeräts:\n{winner}\n\nGespeichert.")
+        if done:
+            done(winner, partner)
 
     def send_codan(self, kind: str):
         to_id = self.codan_call_id.get().strip().replace(" ", "")
