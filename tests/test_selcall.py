@@ -167,6 +167,21 @@ class RadioLinkTest(unittest.TestCase):
         self.assertTrue(any("bestätigt" in line for line in self.logs))
         link.disconnect()
 
+    def test_icom_meter_and_usb_data(self):
+        def radio(d):
+            if b"\x15\x11\xfd" in d:
+                return b"\xfe\xfe\xe0\x94\x15\x11\x01\x28\xfd"       # Po = 128
+            if b"\x15\x13\xfd" in d:
+                return b"\xfe\xfe\xe0\x94\x15\x13\x00\x00\xfd"
+            if b"\x06\x01\x01\xfd" in d or b"\x1a\x06\x01\x01\xfd" in d:
+                return b"\xfe\xfe\xe0\x94\xfb\xfd"
+            return None
+        dev, link = self._icom(radio)
+        self.assertEqual(link.icom_meter("PO"), 128)
+        self.assertEqual(link.icom_meter("ALC"), 0)
+        self.assertEqual(link.icom_set_usb_data(), "")
+        link.disconnect()
+
     def test_icom_refuses_tx(self):
         dev, link = self._icom(lambda d: b"\xfe\xfe\xe0\x94\xfa\xfd")
         self.assertFalse(link.set_ptt(True))

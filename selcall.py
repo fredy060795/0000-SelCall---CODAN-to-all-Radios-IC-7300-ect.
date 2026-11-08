@@ -17,6 +17,7 @@ import io
 import json
 import os
 import queue
+import re
 import threading
 import time
 import wave
@@ -131,6 +132,10 @@ def _devices(kind: str):
         result = []
         for i, dev in enumerate(devices):
             if dev[key] > 0 and (api is None or dev["hostapi"] == api):
+                # "Microsoft Sound Mapper" / "Primärer Soundtreiber" = the Windows
+                # default device (the PC speakers) - never a radio
+                if re.search(r"mapper|primär|primary", dev["name"], re.IGNORECASE):
+                    continue
                 if dev["name"] not in [n for _, n in result]:
                     result.append((i, dev["name"]))
         if result:
@@ -346,6 +351,16 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(f_atest, text="PTT-Test 1 s", command=self._test_ptt).pack(side=tk.LEFT)
         ttk.Button(f_atest, text="Alle Audiogeräte ins Protokoll", command=self._log_audio_devices).pack(
             side=tk.LEFT, padx=6)
+        f_atest2 = ttk.Frame(f_audio)
+        f_atest2.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+        ttk.Button(f_atest2, text="🎯 Per Sendetest finden (Icom)", command=self._find_by_tx).pack(side=tk.LEFT)
+        ttk.Button(f_atest2, text="Funkgerät auf USB-D stellen", command=self._set_usb_data).pack(
+            side=tk.LEFT, padx=6)
+        ttk.Button(f_atest2, text="Ton ohne PTT abspielen", command=self._tone_no_ptt).pack(side=tk.LEFT)
+        ttk.Label(f_audio, foreground="gray", justify=tk.LEFT, text=(
+            "Sendetest: spielt nacheinander auf jeder Soundkarte einen Ton und liest dabei die Leistung\n"
+            "des Funkgeräts – die Karte mit Leistung ist die richtige.  'Ton ohne PTT': hörst du ihn\n"
+            "am PC, ist es NICHT die Funkgeräte-Soundkarte.")).grid(row=6, column=0, columnspan=3, sticky=tk.W)
         if sd is None:
             ttk.Label(f_audio, foreground="red", text=(
                 "Modul 'sounddevice' fehlt – darum sind die Listen leer.\n"
@@ -483,6 +498,46 @@ class SettingsDialog(tk.Toplevel):
         tone = self.app.audio_gen.generate_sine_wave(1000, 2000, amplitude=0.5)
         self.app.play_audio_with_ptt(self.app.audio_gen.create_wav_bytes(tone), "Testton 1000 Hz")
 
+    def _prepare_link(self):
+        self.app.cfg.update(self._current_values())
+        self.app.link.disconnect()
+        for problem in self.app.link.connect():
+            self.app.log(f"FEHLER: {problem}")
+        self.app._update_connection_label()
+
+    def _find_by_tx(self):
+        self._prepare_link()
+
+        def _done(out_name, in_name):
+            if self.winfo_exists():
+                self.cb_out.set(out_name)
+                if in_name:
+                    self.cb_in.set(in_name)
+        self.app.find_radio_soundcard(done=_done)
+
+    def _set_usb_data(self):
+        self._prepare_link()
+        problem = self.app.link.icom_set_usb_data()
+        if problem:
+            messagebox.showwarning("USB-D", f"{problem}\nAm Funkgerät die DATA-Taste drücken.", parent=self)
+        else:
+            messagebox.showinfo("USB-D", "Funkgerät steht auf USB-D.", parent=self)
+
+    def _tone_no_ptt(self):
+        name = self.cb_out.get()
+        idx = audio_device_index(name, "out")
+        if sd is None or idx is None:
+            messagebox.showerror("Audio", "Bitte zuerst einen Ausgang wählen.", parent=self)
+            return
+        tone = np.frombuffer(bytes(self.app.audio_gen.generate_sine_wave(1000, 1500, amplitude=0.3)),
+                             dtype="<i2").astype(np.float32) / 32768.0
+        try:
+            sd.play(tone, samplerate=self.app.audio_gen.sample_rate, device=idx)
+        except Exception as exc:
+            messagebox.showerror("Audio", str(exc), parent=self)
+            return
+        self.app.log(f"Ton ohne PTT auf: {name} – hörst du ihn am PC, ist es die falsche Karte")
+
     def _log_audio_devices(self):
         log = self.app.log
         if sd is None:
@@ -503,11 +558,7 @@ class SettingsDialog(tk.Toplevel):
         if not messagebox.askyesno("PTT-Test", "Das Funkgerät geht 1 Sekunde auf Senden (ohne Ton).\n"
                                                "Antenne/Dummy Load angeschlossen?", parent=self):
             return
-        self.app.cfg.update(self._current_values())
-        self.app.link.disconnect()
-        for problem in self.app.link.connect():
-            self.app.log(f"FEHLER: {problem}")
-        self.app._update_connection_label()
+        self._prepare_link()
 
         def _work():
             if self.app.link.set_ptt(True):
@@ -947,10 +998,17 @@ class SelCallApp(tk.Tk):
                 self.log(f"Audio-Ausgang {'fehlt' if not out_name else repr(out_name) + ' nicht gefunden'} – "
                          f"nehme {guess}")
                 out_name, out_dev = guess, audio_device_index(guess, "out")
-        if out_name and out_dev is None:
-            self.log(f"WARNUNG: Audio-Ausgang '{out_name}' nicht gefunden – Standardgerät")
-        elif not out_name:
-            self.log("WARNUNG: kein Audio-Ausgang eingestellt – Windows-Standardgerät")
+        if out_dev is None:
+            # Never play on the Windows default device: that is the PC speaker.
+            why = (f"Die Soundkarte '{out_name}' gibt es gerade nicht" if out_name
+                   else "Es ist keine Funkgeräte-Soundkarte eingestellt")
+            self.log(f"NICHT gesendet: {why}")
+            if messagebox.askyesno("Soundkarte fehlt", f"{why} – der Ton würde sonst am PC herauskommen.\n\n"
+                                   "Jetzt die Soundkarte des Funkgeräts suchen?\n"
+                                   "(Einstellungen öffnen → 'Per Sendetest finden')"):
+                self.open_settings()
+            return
+        self.log(f"Ton geht an: {out_name}")
         if not self.tx_lock.acquire(blocking=False):
             self.log("Sender belegt – bitte warten")
             return
@@ -970,7 +1028,9 @@ class SelCallApp(tk.Tk):
                     return
                 time.sleep(max(0, int(self.cfg.get("PTT_DELAY_MS", 300))) / 1000.0)
                 try:
-                    sd.play(samples, samplerate=rate, device=out_dev, blocking=True)
+                    sd.play(samples, samplerate=rate, device=out_dev)
+                    self._check_tx_audio(len(samples) / rate)
+                    sd.wait()
                 except Exception as exc:
                     self.log(f"Audio Fehler: {exc}")
                 time.sleep(0.15)
@@ -981,6 +1041,102 @@ class SelCallApp(tk.Tk):
                 self.tx_lock.release()
 
         threading.Thread(target=_play, daemon=True).start()
+
+    def _check_tx_audio(self, duration: float):
+        """Icom: read ALC/Po during TX - shows at once whether the tone reaches the radio."""
+        if self.link.ptt_method != "CAT" or self.link.cat_protocol.upper() != "ICOM" or duration < 0.8:
+            return
+        time.sleep(0.5)
+        po, alc = self.link.icom_meter("PO"), self.link.icom_meter("ALC")
+        if po is None and alc is None:
+            return
+        self.log(f"Während TX: Leistung {po} / ALC {alc} (0–255)")
+        if not po and not alc:
+            self.log("WARNUNG: kein Ton am Funkgerät (Leistung 0) – falsche Soundkarte, oder am IC-7300 "
+                     "nicht USB-D / DATA MOD ≠ USB / USB MOD Level 0 %")
+
+    def find_radio_soundcard(self, done=None):
+        """Icom with CAT: key up, play a tone on each sound card, read the power.
+        The card that makes power is the radio's."""
+        if self.link.ptt_method != "CAT" or self.link.cat_protocol.upper() != "ICOM":
+            messagebox.showinfo("Sendetest", "Der Sendetest braucht ein Icom mit PTT Methode CAT "
+                                             "(das Programm liest die Leistung über CI-V).")
+            return
+        if not self.link.rig.is_open:
+            for problem in self.link.connect():
+                self.log(f"FEHLER: {problem}")
+        if not self.link.rig.is_open:
+            messagebox.showerror("Sendetest", "RIG COM Port ist nicht verbunden.")
+            return
+        outputs = audio_devices("out")
+        guess = autodetect.guess_by_name(outputs)
+        candidates = sorted(outputs, key=lambda n: (n != guess, "USB" not in n.upper()))[:10]
+        if not candidates:
+            messagebox.showerror("Sendetest", "Keine Soundkarten gefunden (py -m pip install sounddevice?).")
+            return
+        if not messagebox.askyesno("Sendetest", (
+                f"Das Funkgerät sendet jetzt bis zu {len(candidates)}× kurz (je 1 s, 1000 Hz).\n"
+                "Antenne/Dummy Load anschließen, wenig Leistung, freie Frequenz im Amateurband.\n"
+                "Am PC kann es dabei kurz piepen (das sind die falschen Soundkarten).\n\nStarten?")):
+            return
+        if self.link.icom_set_usb_data():
+            self.log("Hinweis: USB-D konnte nicht gesetzt werden – am Funkgerät DATA-Taste drücken")
+        tone = np.frombuffer(bytes(self.audio_gen.generate_sine_wave(1000, 1000, amplitude=0.4)),
+                             dtype="<i2").astype(np.float32) / 32768.0
+        rate = self.audio_gen.sample_rate
+
+        def _work():
+            results = []
+            with self.tx_lock:
+                for name in candidates:
+                    idx = audio_device_index(name, "out")
+                    if idx is None:
+                        continue
+                    if not self.link.set_ptt(True):
+                        self.log("Sendetest abgebrochen: PTT geht nicht (siehe oben)")
+                        break
+                    best = 0
+                    try:
+                        time.sleep(0.25)
+                        sd.play(tone, samplerate=rate, device=idx)
+                        for _ in range(3):
+                            time.sleep(0.2)
+                            best = max(best, self.link.icom_meter("PO") or 0, self.link.icom_meter("ALC") or 0)
+                        sd.wait()
+                    except Exception as exc:
+                        self.log(f"Sendetest {name}: {exc}")
+                    finally:
+                        self.link.set_ptt(False)
+                    self.log(f"Sendetest {name}: Leistung/ALC {best}")
+                    results.append((best, name))
+                    time.sleep(0.4)
+            results.sort(reverse=True)
+            winner = results[0][1] if results and results[0][0] > 0 else None
+
+            def _finish():
+                if winner is None:
+                    messagebox.showwarning("Sendetest", (
+                        "Bei keiner Soundkarte kam Leistung heraus.\n\nAm IC-7300 prüfen:\n"
+                        "• Betriebsart USB-D (DATA-Taste)\n"
+                        "• MENU > SET > Connectors > MOD Input > DATA MOD = USB\n"
+                        "• MENU > SET > Connectors > USB MOD Level nicht 0 %\n"
+                        "• Icom USB-Treiber installiert, Funkgerät war beim PC-Start eingeschaltet"))
+                    return
+                inputs = audio_devices("in")
+                self.cfg["AUDIO_OUT"] = winner
+                partner = autodetect.pick_partner(inputs, winner)
+                if partner:
+                    self.cfg["AUDIO_IN"] = partner
+                try:
+                    save_config(self.cfg)
+                except OSError:
+                    pass
+                self.log(f"Funkgeräte-Soundkarte gefunden und gespeichert: {winner}")
+                messagebox.showinfo("Sendetest", f"Soundkarte des Funkgeräts:\n{winner}\n\nGespeichert.")
+                if done:
+                    done(winner, partner)
+            self.after(0, _finish)
+        threading.Thread(target=_work, daemon=True).start()
 
     def send_codan(self, kind: str):
         to_id = self.codan_call_id.get().strip().replace(" ", "")
