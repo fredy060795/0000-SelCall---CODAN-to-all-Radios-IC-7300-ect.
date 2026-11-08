@@ -16,7 +16,7 @@ sys.path.insert(0, ROOT)
 import numpy as np  # noqa: E402
 
 import radio_models  # noqa: E402
-from selcall_codec import AudioGenerator, CodanSelcallEncoder  # noqa: E402
+from selcall_codec import AudioGenerator, CCIR493Decoder, CodanSelcallEncoder, describe_call  # noqa: E402
 
 try:
     import pty
@@ -238,6 +238,75 @@ class ProbeTest(unittest.TestCase):
         dev = FakeDevice(lambda line: None)
         self.assertIsNone(autodetect.probe_rig(dev.port, "YAESU", bauds=(38400,)))
         self.assertIsNone(autodetect.probe_ptc(dev.port, bauds=(57600,)))
+
+
+def _audio(enc, gen, *args, **kwargs):
+    pcm = bytes(enc.generate(gen, *args, **kwargs))
+    return np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+
+
+def _decode(signal):
+    dec, calls = CCIR493Decoder(), []
+    for i in range(0, len(signal), 4800):
+        calls += dec.feed(signal[i:i + 4800])
+    return calls + dec.flush()
+
+
+class CallTypesTest(unittest.TestCase):
+    def setUp(self):
+        self.enc, self.gen = CodanSelcallEncoder(), AudioGenerator()
+
+    def test_page_and_status_and_gps_round_trip(self):
+        rng = np.random.default_rng(3)
+        quiet = lambda n: rng.normal(0, 0.05, n).astype(np.float32)
+        signal = np.concatenate([
+            quiet(20000),
+            _audio(self.enc, self.gen, "435201", "435299", content=self.enc.page_content("Treffpunkt 14:30")),
+            quiet(10000),
+            _audio(self.enc, self.gen, "435201", "435299", content=self.enc.STATUS_REQUEST, preamble_s=1),
+            _audio(self.enc, self.gen, "4352", "4353", content=self.enc.GPS_REQUEST, preamble_s=1),
+            _audio(self.enc, self.gen, "4352", "4353", fmt=123, preamble_s=1),
+            quiet(48000)])
+        signal += rng.normal(0, 0.15, len(signal)).astype(np.float32)
+        calls = [(c["kind"], c["from"], c["to"], c["text"]) for c in _decode(signal)]
+        self.assertEqual(calls, [("Nachricht", "435299", "435201", "TREFFPUNKT 14:30"),
+                                 ("Status-Abfrage", "435299", "435201", ""),
+                                 ("GPS-Abfrage", "4353", "4352", ""),
+                                 ("Kanaltest", "4353", "4352", "")])
+
+    def test_sound_card_clock_off_by_one_percent(self):
+        a = _audio(self.enc, self.gen, "435201", "435299", content=self.enc.page_content("X" * 32))
+        for drift in (1.01, 0.99):
+            x = np.interp(np.arange(0, len(a), drift), np.arange(len(a)), a).astype(np.float32)
+            self.assertEqual([c["text"] for c in _decode(x)], ["X" * 32])
+
+    def test_noise_makes_no_call(self):
+        noise = np.random.default_rng(9).normal(0, 0.3, 48000 * 20).astype(np.float32)
+        self.assertEqual(_decode(noise), [])
+
+    def test_page_limits(self):
+        with self.assertRaises(ValueError):
+            self.enc.page_content("X" * 33)
+        with self.assertRaises(ValueError):
+            self.enc.page_content("Grüße")
+        self.assertEqual(self.enc.page_content("ab"), [116, 65, 66])
+
+    def test_describe_reply(self):
+        call = describe_call([120, 43, 52, 1, 100, 43, 52, 99, 122, 122])
+        self.assertEqual((call["kind"], call["from"], call["to"]), ("Selcall (Antwort/Quittung)", "435299", "435201"))
+
+
+@unittest.skipIf(pty is None, "needs pyserial")
+class CicsCommandTest(unittest.TestCase):
+    def test_commands(self):
+        link = radio_link.RadioLink({"RADIO_MODEL": "CODAN ENVOY"}, lambda t: None, lambda n: None)
+        self.assertEqual(link.codan_command_text("page", "435201", "435299", 'Hallo "Wien"'),
+                         "pagecall 435201 \"Hallo 'Wien'\"")
+        self.assertEqual(link.codan_command_text("status", "435201", "435299"), "statuscall 435201")
+        self.assertEqual(link.codan_command_text("gps", "435201", "435299"), "gpscall 435201")
+        link.cfg["CODAN_SEND_SELF_ID"] = True
+        self.assertEqual(link.codan_command_text("status", "435201", "435299"), "statuscall 435201 from 435299")
+        self.assertEqual(link.codan_command_text("hangup", "", "435299"), "hangup")
 
 
 if __name__ == "__main__":

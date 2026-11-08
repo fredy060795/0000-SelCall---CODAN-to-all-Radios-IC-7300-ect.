@@ -16,6 +16,7 @@ keys the radio by CAT/RTS/DTR.
 import io
 import json
 import os
+import queue
 import threading
 import time
 import wave
@@ -32,8 +33,8 @@ except Exception:  # pragma: no cover
 import autodetect
 import radio_models
 from radio_link import (CAT_PROTOCOLS, PTC_BAUD_RATES, PTC_MODEM_TYPES, PTT_METHODS, RIG_BAUD_RATES,
-                        DEFAULT_CODAN_BEACON_CMD, DEFAULT_CODAN_SELCALL_CMD, RadioLink, list_serial_ports)
-from selcall_codec import NECODE_TONES, TONE_STANDARDS, AudioGenerator, CodanSelcallEncoder
+                        CODAN_CALLS, RadioLink, list_serial_ports)
+from selcall_codec import NECODE_TONES, TONE_STANDARDS, AudioGenerator, CCIR493Decoder, CodanSelcallEncoder
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
@@ -53,8 +54,7 @@ DEFAULT_CONFIG = {
     "AUDIO_OUT": "",
     "OUR_ID": "",
     "CODAN_MODE": "AUTO",            # AUTO: Codan -> CICS, others -> audio | CICS | AUDIO
-    "CODAN_SELCALL_CMD": DEFAULT_CODAN_SELCALL_CMD,
-    "CODAN_BEACON_CMD": DEFAULT_CODAN_BEACON_CMD,
+    **{key: default for key, default, _name in CODAN_CALLS.values()},
     "CODAN_SEND_SELF_ID": False,
     "CODAN_PREAMBLE_S": 2.0,
     "AUTO_CONNECT": True,
@@ -170,6 +170,18 @@ class AudioDecoderEngine:
         self.is_running = False
         self.last_char = None
         self.last_time = 0
+        self.ccir493 = CCIR493Decoder(sample_rate)
+        self.blocks = queue.Queue(maxsize=400)
+        threading.Thread(target=self._ccir493_worker, daemon=True).start()
+
+    def _ccir493_worker(self):
+        while True:
+            block = self.blocks.get()
+            try:
+                for call in self.ccir493.feed(block):
+                    self.app_callback("call", call)
+            except Exception:
+                pass
 
     def start(self, device_id):
         self.stop()
@@ -201,6 +213,10 @@ class AudioDecoderEngine:
         signal_data = indata[:, 0]
         rms = float(np.sqrt(np.mean(signal_data ** 2)))
         self.app_callback("level", rms)
+        try:
+            self.blocks.put_nowait(signal_data.copy())   # CODAN decoder runs in its own thread
+        except queue.Full:
+            pass
         if rms < 0.02:
             return
         fft_data = np.abs(np.fft.rfft(signal_data * np.hanning(len(signal_data))))
@@ -322,19 +338,21 @@ class SettingsDialog(tk.Toplevel):
                                    str(cfg.get("CODAN_MODE", "AUTO")))
         ttk.Label(f_codan, foreground="gray", text="AUTO: Codan → Funkgerät selbst (CICS), andere → PC (Audio)").grid(
             row=2, column=0, columnspan=3, sticky=tk.W)
-        ttk.Label(f_codan, text="CICS Selcall:").grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.e_cmd_sel = ttk.Entry(f_codan, width=30)
-        self.e_cmd_sel.insert(0, str(cfg.get("CODAN_SELCALL_CMD", DEFAULT_CODAN_SELCALL_CMD)))
-        self.e_cmd_sel.grid(row=3, column=1, columnspan=2, sticky=tk.W, pady=2)
-        ttk.Label(f_codan, text="CICS Kanaltest:").grid(row=4, column=0, sticky=tk.W, pady=2)
-        self.e_cmd_bea = ttk.Entry(f_codan, width=30)
-        self.e_cmd_bea.insert(0, str(cfg.get("CODAN_BEACON_CMD", DEFAULT_CODAN_BEACON_CMD)))
-        self.e_cmd_bea.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=2)
+        self.e_cmds = {}
+        row = 3
+        for kind, (key, default, name) in CODAN_CALLS.items():
+            ttk.Label(f_codan, text=f"CICS {name}:").grid(row=row, column=0, sticky=tk.W, pady=1)
+            entry = ttk.Entry(f_codan, width=30)
+            entry.insert(0, str(cfg.get(key, default) or default))
+            entry.grid(row=row, column=1, columnspan=2, sticky=tk.W, pady=1)
+            self.e_cmds[key] = (entry, default)
+            row += 1
         self.v_from = tk.BooleanVar(value=bool(cfg.get("CODAN_SEND_SELF_ID", False)))
         ttk.Checkbutton(f_codan, text="eigene ID mitsenden („from <ID>“)", variable=self.v_from).grid(
-            row=5, column=1, columnspan=2, sticky=tk.W)
-        ttk.Label(f_codan, foreground="gray", text="{to} = gerufene Station, {self} = eigene ID").grid(
-            row=6, column=0, columnspan=3, sticky=tk.W)
+            row=row, column=1, columnspan=2, sticky=tk.W)
+        ttk.Label(f_codan, foreground="gray",
+                  text="{to} = gerufene Station, {self} = eigene ID, {msg} = Nachricht").grid(
+            row=row + 1, column=0, columnspan=3, sticky=tk.W)
 
         self.v_auto = tk.BooleanVar(value=bool(cfg.get("AUTO_CONNECT", True)))
         ttk.Checkbutton(outer, text="Beim Start automatisch verbinden", variable=self.v_auto).pack(anchor=tk.W)
@@ -481,8 +499,7 @@ class SettingsDialog(tk.Toplevel):
         cfg.update({
             "OUR_ID": our,
             "CODAN_MODE": self.cb_mode.get(),
-            "CODAN_SELCALL_CMD": self.e_cmd_sel.get().strip() or DEFAULT_CODAN_SELCALL_CMD,
-            "CODAN_BEACON_CMD": self.e_cmd_bea.get().strip() or DEFAULT_CODAN_BEACON_CMD,
+            **{key: (entry.get().strip() or default) for key, (entry, default) in self.e_cmds.items()},
             "CODAN_SEND_SELF_ID": bool(self.v_from.get()),
             "AUTO_CONNECT": bool(self.v_auto.get()),
         })
@@ -508,6 +525,7 @@ class SelCallApp(tk.Tk):
         self.audio_gen = AudioGenerator()
         self.codan_encoder = CodanSelcallEncoder()
         self.link = RadioLink(self.cfg, self.log, self.profiles.get)
+        self.link.on_radio_line = self.on_radio_line
         self.tx_lock = threading.Lock()
         self.decoder_engine = AudioDecoderEngine(self.on_decoder_event)
 
@@ -581,40 +599,96 @@ class SelCallApp(tk.Tk):
         self.txt_log.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
     def _build_codan_tab(self):
-        top = ttk.Frame(self.tab_codan, padding=10)
+        top = ttk.Frame(self.tab_codan, padding=(10, 6))
         top.pack(fill=tk.X)
         self.codan_priority = tk.StringVar(value="Routine")
         for p in CodanSelcallEncoder.CATEGORIES:
             ttk.Radiobutton(top, text=p, value=p, variable=self.codan_priority, style="Toolbutton").pack(
                 side=tk.LEFT, padx=2)
 
-        form = ttk.Frame(self.tab_codan, padding=10)
-        form.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(form, text="Gerufene Station (4/6 Ziffern):").grid(row=0, column=0, sticky=tk.W, pady=5)
-        self.codan_call_id = ttk.Entry(form, width=12, font=("Segoe UI", 12))
-        self.codan_call_id.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
+        form = ttk.Frame(self.tab_codan, padding=(10, 2))
+        form.pack(fill=tk.X)
+        ttk.Label(form, text="Station (4/6 Ziffern):").grid(row=0, column=0, sticky=tk.W, pady=3)
+        self.codan_call_id = ttk.Entry(form, width=10, font=("Segoe UI", 12))
+        self.codan_call_id.grid(row=0, column=1, sticky=tk.W, padx=6, pady=3)
         self.codan_call_id.bind("<Return>", lambda _e: self.send_codan("selcall"))
-        ttk.Label(form, text="Eigene ID:").grid(row=1, column=0, sticky=tk.W, pady=5)
-        self.lbl_our_id = ttk.Label(form, text="")
-        self.lbl_our_id.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
+        self.lbl_our_id = ttk.Label(form, text="", foreground="gray")
+        self.lbl_our_id.grid(row=0, column=2, sticky=tk.W, padx=6)
 
-        ttk.Label(form, text="Vorspann bei Audio (s):").grid(row=2, column=0, sticky=tk.W, pady=5)
-        self.codan_preamble = ttk.Spinbox(form, from_=0.5, to=30, increment=0.5, width=6)
+        ttk.Label(form, text="Nachricht (SMS):").grid(row=1, column=0, sticky=tk.W, pady=3)
+        self.codan_msg = ttk.Entry(form, width=40)
+        self.codan_msg.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=6, pady=3)
+        self.codan_msg.bind("<KeyRelease>", lambda _e: self._update_msg_count())
+        self.codan_msg.bind("<Return>", lambda _e: self.send_codan("page"))
+        self.lbl_msg_count = ttk.Label(form, text="", foreground="gray")
+        self.lbl_msg_count.grid(row=1, column=3, sticky=tk.W)
+
+        buttons = ttk.Frame(self.tab_codan, padding=(10, 4))
+        buttons.pack(fill=tk.X)
+        for text, kind in (("📞 Anpagern (Selcall)", "selcall"), ("✉ Nachricht senden", "page"),
+                           ("❓ Status abfragen", "status"), ("📍 GPS abfragen", "gps"),
+                           ("Kanaltest", "beacon"), ("Auflegen", "hangup")):
+            ttk.Button(buttons, text=text, command=lambda k=kind: self.send_codan(k)).pack(
+                side=tk.LEFT, padx=(0, 4), ipady=3)
+
+        opts = ttk.Frame(self.tab_codan, padding=(10, 2))
+        opts.pack(fill=tk.X)
+        ttk.Label(opts, text="Vorspann bei Audio (s):").pack(side=tk.LEFT)
+        self.codan_preamble = ttk.Spinbox(opts, from_=0.5, to=30, increment=0.5, width=5)
         self.codan_preamble.set(str(self.cfg.get("CODAN_PREAMBLE_S", 2.0)))
-        self.codan_preamble.grid(row=2, column=1, sticky=tk.W, padx=10, pady=5)
-        ttk.Label(form, text="2 s Gegenstation auf Kanal, 6–12 s scannt", foreground="gray").grid(
-            row=2, column=2, sticky=tk.W)
+        self.codan_preamble.pack(side=tk.LEFT, padx=4)
+        ttk.Label(opts, text="2 s auf Kanal · 6–12 s Gegenstation scannt", foreground="gray").pack(side=tk.LEFT)
 
-        buttons = ttk.Frame(form)
-        buttons.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=12)
-        ttk.Button(buttons, text="📞 Selcall senden", command=lambda: self.send_codan("selcall")).pack(
-            side=tk.LEFT, padx=(0, 8), ipady=4)
-        ttk.Button(buttons, text="Kanaltest (Beacon)", command=lambda: self.send_codan("beacon")).pack(
-            side=tk.LEFT, ipady=4)
+        self.lbl_codan_path = ttk.Label(self.tab_codan, text="", foreground="gray", justify=tk.LEFT,
+                                        padding=(10, 2))
+        self.lbl_codan_path.pack(fill=tk.X)
 
-        self.lbl_codan_path = ttk.Label(form, text="", foreground="gray", justify=tk.LEFT)
-        self.lbl_codan_path.grid(row=4, column=0, columnspan=3, sticky=tk.W)
+        inbox = ttk.LabelFrame(self.tab_codan, text="Eingang (Doppelklick = Station übernehmen)", padding=4)
+        inbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        cols = ("zeit", "art", "von", "an", "text")
+        self.tree_inbox = ttk.Treeview(inbox, columns=cols, show="headings", height=5)
+        for col, title, width in (("zeit", "Zeit", 60), ("art", "Art", 140), ("von", "Von", 70),
+                                  ("an", "An", 70), ("text", "Text / Inhalt", 250)):
+            self.tree_inbox.heading(col, text=title)
+            self.tree_inbox.column(col, width=width, anchor=tk.W, stretch=(col == "text"))
+        self.tree_inbox.tag_configure("mine", background="#fff2cc")
+        self.tree_inbox.pack(fill=tk.BOTH, expand=True)
+        self.tree_inbox.bind("<Double-1>", self._take_station_from_inbox)
         self._update_codan_labels()
+        self._update_msg_count()
+
+    def _update_msg_count(self):
+        n = len(self.codan_msg.get())
+        limit = CodanSelcallEncoder.PAGE_MAX_CHARS if not self._codan_uses_cics() else 64
+        self.lbl_msg_count.config(text=f"{n}/{limit}", foreground="red" if n > limit else "gray")
+
+    def _take_station_from_inbox(self, _event):
+        sel = self.tree_inbox.selection()
+        if sel:
+            station = self.tree_inbox.item(sel[0], "values")[2]
+            if station and station.isdigit():
+                self.codan_call_id.delete(0, tk.END)
+                self.codan_call_id.insert(0, station)
+
+    def add_inbox(self, kind: str, frm: str = "", to: str = "", text: str = ""):
+        def _do():
+            mine = bool(to) and to == str(self.cfg.get("OUR_ID", ""))
+            self.tree_inbox.insert("", 0, values=(time.strftime("%H:%M:%S"), kind, frm, to, text),
+                                   tags=("mine",) if mine else ())
+            if mine:
+                self.bell()
+        self.after(0, _do)
+
+    def on_radio_line(self, port: str, text: str):
+        """Lines the Codan prints by itself (incoming calls, messages, status)."""
+        if self.link.is_echo(text):
+            return    # echo of our own command / modem prompt
+        upper = text.upper()
+        if upper.startswith(("TRX ", "PTC ")) or " FREQUENCY CHANGED" in upper:
+            return
+        if any(word in upper for word in ("CALL", "MSG", "MESSAGE", "PAGE", "STATUS", "GPS", "POSITION",
+                                          "BEACON", "SELCALL")):
+            self.add_inbox(f"Codan meldet ({port})", text=text)
 
     def _build_tone_tab(self):
         top = ttk.Frame(self.tab_tone, padding=10)
@@ -678,7 +752,7 @@ class SelCallApp(tk.Tk):
         self.btn_connect.config(text="Trennen" if (self.link.rig.is_open or self.link.ptc.is_open) else "Verbinden")
 
     def _update_codan_labels(self):
-        self.lbl_our_id.config(text=self.cfg.get("OUR_ID") or "– (Einstellungen)")
+        self.lbl_our_id.config(text=f"eigene ID: {self.cfg.get('OUR_ID') or '– (Einstellungen)'}")
         method = self.link.ptt_method
         if self._codan_uses_cics():
             way = "über das Modem (TRX T …)" if method == "TNC" else "direkt am RIG Port"
@@ -699,6 +773,8 @@ class SelCallApp(tk.Tk):
         self._auto_audio_if_missing()
         if self.cfg.get("AUTO_CONNECT", True):
             self.connect()
+        if not self._codan_uses_cics() and self.cfg.get("AUDIO_IN"):
+            self.after(1500, self.start_rx_engine)     # hear answers and incoming calls
 
     def _auto_audio_if_missing(self):
         """No (or a vanished) sound card set: find the radio's sound card by itself."""
@@ -791,7 +867,7 @@ class SelCallApp(tk.Tk):
         self.e_raw.delete(0, tk.END)
 
     # --------------------------------------------------------------- TX
-    def play_audio_with_ptt(self, wav_bytes: bytes, label: str):
+    def play_audio_with_ptt(self, wav_bytes: bytes, label: str, listen_after: bool = False):
         problem = self.link.can_key_audio()
         if problem:
             self.log(f"FEHLER: {problem}")
@@ -837,8 +913,8 @@ class SelCallApp(tk.Tk):
                 time.sleep(0.15)
             finally:
                 self.link.set_ptt(False)
-                if rx_running:
-                    self.after(0, self.toggle_rx_engine)
+                if rx_running or (listen_after and self.cfg.get("AUDIO_IN")):
+                    self.after(0, self.start_rx_engine)
                 self.tx_lock.release()
 
         threading.Thread(target=_play, daemon=True).start()
@@ -846,13 +922,20 @@ class SelCallApp(tk.Tk):
     def send_codan(self, kind: str):
         to_id = self.codan_call_id.get().strip().replace(" ", "")
         our_id = str(self.cfg.get("OUR_ID", "")).strip()
-        if not (to_id.isdigit() and len(to_id) in (4, 6)):
-            messagebox.showerror("CODAN", "Gerufene Station: 4 oder 6 Ziffern (z.B. 435299).")
+        message = self.codan_msg.get().strip()
+        name = CODAN_CALLS[kind][2]
+        if kind != "hangup" and not (to_id.isdigit() and len(to_id) in (4, 6)):
+            messagebox.showerror("CODAN", "Station: 4 oder 6 Ziffern (z.B. 435299).")
             return
-        name = "Selcall" if kind == "selcall" else "Kanaltest"
+        if kind == "page" and not message:
+            messagebox.showerror("CODAN", "Bitte eine Nachricht eingeben.")
+            return
 
         if self._codan_uses_cics():
-            command = self.link.codan_command_text(kind, to_id, our_id)
+            if kind == "page" and len(message) > 64:
+                messagebox.showerror("CODAN", "Nachricht: höchstens 64 Zeichen.")
+                return
+            command = self.link.codan_command_text(kind, to_id, our_id, message)
 
             def _work():
                 if not self.link.connected:
@@ -860,17 +943,23 @@ class SelCallApp(tk.Tk):
                     for problem in self.link.connect():
                         self.log(f"FEHLER: {problem}")
                     self.after(0, self._update_connection_label)
-                self.log(f"CODAN {name} an {to_id} per CICS: {command}")
+                self.log(f"CODAN {name} an {to_id or '-'} per CICS: {command}")
                 problem = self.link.send_codan_cics(command)
                 if problem:
                     self.log(f"FEHLER: {problem}")
                     self.after(0, lambda: messagebox.showerror("CODAN", problem))
                 else:
                     self.log(f"{name} übergeben – Codan sendet jetzt selbst")
+                    self.add_inbox(f"→ {name} gesendet", our_id, to_id, message if kind == "page" else "")
+                    if kind == "page":
+                        self.after(0, lambda: (self.codan_msg.delete(0, tk.END), self._update_msg_count()))
             threading.Thread(target=_work, daemon=True).start()
             return
 
         # PC makes the CCIR 493-4 signal
+        if kind == "hangup":
+            messagebox.showinfo("CODAN", "Auflegen geht nur, wenn der Codan selbst sendet (CICS).")
+            return
         if not (our_id.isdigit() and len(our_id) == len(to_id)):
             messagebox.showerror("CODAN", "Eigene ID (Einstellungen) muss gleich viele Ziffern haben wie die "
                                           "gerufene Station (4 oder 6).")
@@ -880,16 +969,24 @@ class SelCallApp(tk.Tk):
         except ValueError:
             preamble = 2.0
         self.cfg["CODAN_PREAMBLE_S"] = preamble
-        fmt = CodanSelcallEncoder.FMT_SELCALL if kind == "selcall" else CodanSelcallEncoder.FMT_CHANNEL_TEST
-        category = CodanSelcallEncoder.CATEGORIES.get(self.codan_priority.get(), 100)
+        enc = CodanSelcallEncoder
+        fmt = enc.FMT_CHANNEL_TEST if kind == "beacon" else enc.FMT_SELCALL
+        category = enc.CATEGORIES.get(self.codan_priority.get(), 100)
         try:
+            content = {"page": lambda: enc.page_content(message), "status": lambda: list(enc.STATUS_REQUEST),
+                       "gps": lambda: list(enc.GPS_REQUEST)}.get(kind, lambda: [])()
             audio = self.codan_encoder.generate(self.audio_gen, to_id, our_id, fmt=fmt, category=category,
-                                                preamble_s=preamble)
+                                                preamble_s=preamble, content=content)
         except ValueError as exc:
             messagebox.showerror("CODAN", str(exc))
             return
+        self.add_inbox(f"→ {name} gesendet", our_id, to_id, message.upper() if kind == "page" else "")
+        if kind == "page":
+            self.codan_msg.delete(0, tk.END)
+            self._update_msg_count()
         self.play_audio_with_ptt(self.audio_gen.create_wav_bytes(audio),
-                                 f"CODAN {name} {our_id} → {to_id} (CCIR 493-4, Vorspann {preamble:.1f} s)")
+                                 f"CODAN {name} {our_id} → {to_id} (CCIR 493-4, Vorspann {preamble:.1f} s)",
+                                 listen_after=kind in ("status", "gps", "selcall", "beacon", "page"))
 
     # ------------------------------------------------------ tone selcall
     def on_mode_change(self, _event):
@@ -953,6 +1050,10 @@ class SelCallApp(tk.Tk):
             self.play_audio_with_ptt(self.audio_gen.create_wav_bytes(audio), f"Necode {call_id}")
 
     # ------------------------------------------------------------- RX
+    def start_rx_engine(self):
+        if not self.decoder_engine.is_running:
+            self.toggle_rx_engine()
+
     def toggle_rx_engine(self):
         if self.decoder_engine.is_running:
             self.decoder_engine.stop()
@@ -965,6 +1066,7 @@ class SelCallApp(tk.Tk):
             return
         if self.decoder_engine.start(dev):
             self.btn_rx.config(text="RX Decoder Stop")
+            self.log("RX Decoder läuft (CODAN/CCIR 493-4 und Tonfolgen)")
         else:
             messagebox.showerror("RX", "Audio-Eingang konnte nicht gestartet werden.")
 
@@ -973,6 +1075,11 @@ class SelCallApp(tk.Tk):
             return self.mode_var.get()
         if event_type == "level":
             self.after(0, lambda: self.progress_level.configure(value=min(data * 300, 100)))
+        elif event_type == "call":
+            call = data
+            text = call["text"]
+            self.log(f"RX CODAN {call['kind']} von {call['from']} an {call['to']}" + (f": {text}" if text else ""))
+            self.add_inbox(call["kind"], call["from"], call["to"], text)
         elif event_type == "char":
             mode, char, rms = data
 

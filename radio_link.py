@@ -64,11 +64,20 @@ PTC_MODEM_TYPES = ("AUTO", "PTC-II", "DR-7400", "DR-7800", "DR-9400")
 PTC_BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 RIG_BAUD_RATES = (4800, 9600, 19200, 38400, 57600, 115200)
 
-# Codan CICS call commands.  {to} = called station, {self} = own address.
-# "selcall" and "beacon" (channel test) are the CICS V3 commands of Envoy and
-# NGT / 2110; the self address is optional (the radio uses its own).
+# Codan CICS call commands (CICS V3: Envoy, NGT, 2110).  {to} = called
+# station, {self} = own address, {msg} = message text.  The self address is
+# optional: without it the radio uses its own.
 DEFAULT_CODAN_SELCALL_CMD = "selcall {to}"
 DEFAULT_CODAN_BEACON_CMD = "beacon {to}"
+CODAN_CALLS = {
+    # kind: (settings key, default command, name in the log)
+    "selcall": ("CODAN_SELCALL_CMD", DEFAULT_CODAN_SELCALL_CMD, "Selcall"),
+    "page": ("CODAN_PAGE_CMD", 'pagecall {to} "{msg}"', "Nachricht (Pagecall)"),
+    "status": ("CODAN_STATUS_CMD", "statuscall {to}", "Status-Abfrage"),
+    "gps": ("CODAN_GPS_CMD", "gpscall {to}", "GPS-Abfrage"),
+    "beacon": ("CODAN_BEACON_CMD", DEFAULT_CODAN_BEACON_CMD, "Kanaltest"),
+    "hangup": ("CODAN_HANGUP_CMD", "hangup", "Auflegen"),
+}
 
 
 def list_serial_ports() -> list:
@@ -217,8 +226,30 @@ class RadioLink:
         self._modem_trx_setup_for = ""
 
     # ------------------------------------------------------------------ setup
+    on_radio_line = None      # app hook: every text line from radio/modem
+
+    def remember_sent(self, text: str):
+        recent = getattr(self, "_sent", [])
+        recent.append(text.strip().lower())
+        self._sent = recent[-20:]
+
+    def is_echo(self, text: str) -> bool:
+        """True for the radio's/modem's echo of a command we sent, or a bare prompt."""
+        t = text.strip().lower()
+        if t.startswith("cmd:"):
+            t = t[4:].strip()
+        if not t:
+            return True
+        return any(t == sent or t == f"trx t {sent}" or t.endswith(sent) and len(t) - len(sent) <= 6
+                   for sent in getattr(self, "_sent", []))
+
     def _on_line(self, port: str, text: str):
         self.log(f"{port} → {text}")
+        if self.on_radio_line is not None:
+            try:
+                self.on_radio_line(port, text)
+            except Exception:
+                pass
         upper = text.upper()
         for modem in ("DR-9400", "DR-7800", "DR-7400", "PTC-IIIUSB", "PTC-II"):
             if port == "PTC" and modem in upper and not self.detected_modem:
@@ -330,12 +361,13 @@ class RadioLink:
         self._modem_trx_setup_for = profile.name
 
     # ---------------------------------------------------------------- Codan
-    def codan_command_text(self, kind: str, to_id: str, self_id: str) -> str:
-        key = "CODAN_BEACON_CMD" if kind == "beacon" else "CODAN_SELCALL_CMD"
-        default = DEFAULT_CODAN_BEACON_CMD if kind == "beacon" else DEFAULT_CODAN_SELCALL_CMD
+    def codan_command_text(self, kind: str, to_id: str, self_id: str, message: str = "") -> str:
+        key, default, _name = CODAN_CALLS.get(kind, CODAN_CALLS["selcall"])
         template = str(self.cfg.get(key, default) or default)
-        text = template.replace("{to}", to_id).replace("{self}", self_id)
-        if self.cfg.get("CODAN_SEND_SELF_ID", False) and "{self}" not in template and self_id:
+        msg = str(message or "").replace('"', "'").replace("\r", " ").replace("\n", " ").strip()
+        text = template.replace("{to}", to_id).replace("{self}", self_id).replace("{msg}", msg)
+        if (self.cfg.get("CODAN_SEND_SELF_ID", False) and "{self}" not in template and self_id
+                and "{to}" in template):
             text += f" from {self_id}"
         return text.strip()
 
@@ -347,6 +379,7 @@ class RadioLink:
             if not self._ensure_ptc_terminal_mode():
                 return "PTC ist nicht im Terminalmodus (cmd:)"
             self._ensure_modem_trx_setup()
+            self.remember_sent(command)
             reply = self._ptc_command(f"TRX T {command}", wait=3.0)
             if reply and ("ERROR" in reply.upper() or "NO SUCH" in reply.upper()):
                 return f"Modem/Funkgerät meldet: {reply}"
@@ -354,6 +387,7 @@ class RadioLink:
         if not self.rig.is_open:
             return "RIG COM Port (Codan CICS) ist nicht verbunden"
         self.rig.clear_recent()
+        self.remember_sent(command)
         self.rig.write((command + "\r").encode("ascii", errors="ignore"))
         self.log(f"RIG ← {command}")
         reply = self.rig.wait_for(lambda t: "ERROR" in t.upper() or "OK" in t.upper(), 2.0)

@@ -19,6 +19,32 @@ Wie der Selcall gesendet wird:
         "selcall 435299" + CR am RIG COM Port
     "Kanaltest (Beacon)" sendet "beacon 435299".
 
+FUNKTIONEN IM CODAN-TAB (wie am Envoy)
+--------------------------------------
+  📞 Anpagern (Selcall)   normaler Selcall an die Station
+  ✉ Nachricht senden     SMS/Pagecall, Text im Feld "Nachricht"
+  ❓ Status abfragen      Get Status der Station
+  📍 GPS abfragen         Position der Station anfordern
+  Kanaltest               Beacon / Channel Test
+  Auflegen                (nur Codan per CICS)
+
+  Codan-Funkgerät (CICS):  selcall / pagecall {to} "{msg}" / statuscall /
+                           gpscall / beacon / hangup. Der Codan sendet
+                           selbst; was er zurückmeldet (Antworten,
+                           eingehende Rufe/Nachrichten) erscheint im
+                           "Eingang". Die Befehle sind in den
+                           Einstellungen änderbar.
+  IC-7300 & Co. (Audio):   der PC sendet im offenen Selcall-Format
+                           (Nachricht = 116 + max. 32 Zeichen, Status =
+                           103 103, GPS = 125 125) und hört danach mit:
+                           der RX Decoder erkennt CCIR 493-4 Rufe,
+                           Nachrichten und Antworten und trägt sie in den
+                           "Eingang" ein. Rufe an die eigene ID werden
+                           gelb markiert. Doppelklick übernimmt die
+                           Station als Ziel (zum Antworten).
+  Nachrichten: keine Umlaute (ä ö ü ß), Audio max. 32 Zeichen,
+  CICS max. 64 Zeichen.
+
   Andere Funkgeräte (IC-7300, Yaesu, Kenwood ...):
     Der PC erzeugt das Signal (CCIR 493-4: 100 Baud FSK 1700/1870 Hz,
     bzw. ZVEI/CCIR/DTMF Töne) auf der Soundkarte und schaltet die PTT
