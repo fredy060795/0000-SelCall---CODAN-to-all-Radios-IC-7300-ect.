@@ -29,6 +29,7 @@ try:
 except Exception:  # pragma: no cover
     sd = None
 
+import autodetect
 import radio_models
 from radio_link import (CAT_PROTOCOLS, PTC_BAUD_RATES, PTC_MODEM_TYPES, PTT_METHODS, RIG_BAUD_RATES,
                         DEFAULT_CODAN_BEACON_CMD, DEFAULT_CODAN_SELCALL_CMD, RadioLink, list_serial_ports)
@@ -103,26 +104,53 @@ def save_config(cfg: dict):
         json.dump({k: cfg.get(k, v) for k, v in DEFAULT_CONFIG.items()}, handle, indent=4, ensure_ascii=False)
 
 
-def audio_devices(kind: str) -> list:
-    """Names of input ('in') or output ('out') devices."""
+def _host_api_order():
+    """MME first: it exists on every Windows PC, converts the sample rate itself
+    and shows every device once (DirectSound/WASAPI/WDM-KS list them again)."""
+    try:
+        apis = sd.query_hostapis()
+    except Exception:
+        return []
+    names = [str(api.get("name", "")) for api in apis]
+    order = [i for i, n in enumerate(names) if n == "MME"]
+    order += [i for i, n in enumerate(names) if n != "MME"]
+    return order
+
+
+def _devices(kind: str):
+    """[(index, name)] of one host API (MME on Windows) for 'in' or 'out'."""
     if sd is None:
         return []
     key = "max_input_channels" if kind == "in" else "max_output_channels"
-    names = []
     try:
-        for dev in sd.query_devices():
-            if dev[key] > 0 and dev["name"] not in names:
-                names.append(dev["name"])
+        devices = sd.query_devices()
     except Exception:
-        pass
-    return names
+        return []
+    order = _host_api_order()
+    for api in order[:1] or [None]:
+        result = []
+        for i, dev in enumerate(devices):
+            if dev[key] > 0 and (api is None or dev["hostapi"] == api):
+                if dev["name"] not in [n for _, n in result]:
+                    result.append((i, dev["name"]))
+        if result:
+            return result
+    return []
+
+
+def audio_devices(kind: str) -> list:
+    """Names of input ('in') or output ('out') devices, each sound card once."""
+    return [name for _, name in _devices(kind)]
 
 
 def audio_device_index(name: str, kind: str):
     if sd is None or not name:
         return None
+    for i, dev_name in _devices(kind):
+        if dev_name == name:
+            return i
     key = "max_input_channels" if kind == "in" else "max_output_channels"
-    try:
+    try:  # saved from another host API
         for i, dev in enumerate(sd.query_devices()):
             if dev["name"] == name and dev[key] > 0:
                 return i
@@ -209,6 +237,14 @@ class SettingsDialog(tk.Toplevel):
         outer = ttk.Frame(self, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
 
+        f_auto = ttk.Frame(outer)
+        f_auto.pack(fill=tk.X, pady=(0, 4))
+        self.btn_auto = ttk.Button(f_auto, text="🔍 Automatisch erkennen", command=self._auto_detect)
+        self.btn_auto.pack(side=tk.LEFT)
+        self.lbl_auto = ttk.Label(f_auto, text="Funkgerät wählen, dann hier klicken: sucht COM Ports, Baudrate "
+                                               "und Soundkarte", foreground="gray", wraplength=380)
+        self.lbl_auto.pack(side=tk.LEFT, padx=8)
+
         # --- Funkgerät ---------------------------------------------------
         f_radio = ttk.LabelFrame(outer, text="Funkgerät", padding=8)
         f_radio.pack(fill=tk.X, pady=4)
@@ -266,6 +302,14 @@ class SettingsDialog(tk.Toplevel):
                                   width=40)
         self.cb_in = self._combo(f_audio, 1, "Eingang (RX):", [""] + audio_devices("in"), cfg.get("AUDIO_IN", ""),
                                  width=40)
+        f_atest = ttk.Frame(f_audio)
+        f_atest.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+        ttk.Button(f_atest, text="Nur Soundkarte suchen", command=self._auto_audio).pack(side=tk.LEFT)
+        ttk.Button(f_atest, text="🔊 Testton 2 s (mit PTT)", command=self._test_tone).pack(side=tk.LEFT, padx=6)
+        ttk.Label(f_audio, foreground="gray", justify=tk.LEFT, text=(
+            "Testton: das Funkgerät muss senden und die ALC/Leistung ausschlagen.\n"
+            "Richtiger Eingang: RX Decoder starten – der Pegel zeigt das Rauschen des Empfängers.")).grid(
+            row=3, column=0, columnspan=3, sticky=tk.W)
 
         # --- Codan -------------------------------------------------------
         f_codan = ttk.LabelFrame(outer, text="CODAN Selcall", padding=8)
@@ -300,6 +344,95 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(buttons, text="Speichern", command=self._save).pack(side=tk.RIGHT, padx=4)
         ttk.Button(buttons, text="Abbrechen", command=self.destroy).pack(side=tk.RIGHT)
         self._show_profile()
+
+    def _current_values(self) -> dict:
+        try:
+            delay = max(0, int(float(self.sp_delay.get())))
+        except ValueError:
+            delay = 300
+        radio = self.cb_radio.get()
+        return {
+            "RADIO_MODEL": "" if radio == "(manuell)" else radio,
+            "PTC_SERIAL_PORT": self.cb_ptc_port.get().strip(),
+            "PTC_BAUD": int(self.cb_ptc_baud.get()),
+            "PTC_MODEM_TYPE": self.cb_ptc_type.get(),
+            "RIG_SERIAL_PORT": self.cb_rig_port.get().strip(),
+            "RIG_BAUD": int(self.cb_rig_baud.get()),
+            "CAT_ADDRESS": (self.e_civ.get().strip().lstrip("$") or "94").upper(),
+            "CAT_PROTOCOL": self.cb_proto.get(),
+            "PTT_METHOD": self.cb_ptt.get(),
+            "PTT_DELAY_MS": delay,
+            "AUDIO_OUT": self.cb_out.get(),
+            "AUDIO_IN": self.cb_in.get(),
+        }
+
+    def _apply_found(self, found: dict):
+        setters = {
+            "PTC_SERIAL_PORT": self.cb_ptc_port, "PTC_BAUD": self.cb_ptc_baud, "PTC_MODEM_TYPE": self.cb_ptc_type,
+            "RIG_SERIAL_PORT": self.cb_rig_port, "RIG_BAUD": self.cb_rig_baud,
+            "AUDIO_OUT": self.cb_out, "AUDIO_IN": self.cb_in,
+        }
+        for key, widget in setters.items():
+            if key in found:
+                widget.set(str(found[key]))
+        if "CAT_ADDRESS" in found:
+            self.e_civ.delete(0, tk.END)
+            self.e_civ.insert(0, str(found["CAT_ADDRESS"]))
+
+    def _auto_detect(self, audio_only: bool = False):
+        values = self._current_values()
+        is_codan = values["CAT_PROTOCOL"].upper() == "CODAN"
+        via_modem = values["PTT_METHOD"].upper() == "TNC"
+        # free the ports this program holds; other programs (HFChat) must be closed
+        self.app.link.disconnect()
+        self.app._update_connection_label()
+        self.btn_auto.config(state="disabled")
+        self.lbl_auto.config(text="Suche läuft … (bis zu 1 Minute)")
+        outputs, inputs = audio_devices("out"), audio_devices("in")
+
+        def _work():
+            try:
+                found = autodetect.detect(values, outputs, inputs, self.app.log,
+                                          want_rig=not audio_only and not (is_codan and via_modem),
+                                          want_ptc=not audio_only and (via_modem or is_codan))
+            except Exception as exc:
+                found = {}
+                self.app.log(f"Automatische Erkennung: Fehler {exc}")
+
+            def _done():
+                if not self.winfo_exists():
+                    return
+                self.btn_auto.config(state="normal")
+                self._apply_found(found)
+                parts = []
+                if "RIG_SERIAL_PORT" in found:
+                    parts.append(f"Funkgerät {found['RIG_SERIAL_PORT']} @ {found['RIG_BAUD']}")
+                if "PTC_SERIAL_PORT" in found:
+                    parts.append(f"Modem {found['PTC_SERIAL_PORT']} @ {found['PTC_BAUD']}")
+                if "AUDIO_OUT" in found:
+                    parts.append(f"Audio {found['AUDIO_OUT']}")
+                self.lbl_auto.config(text=("Gefunden: " + " | ".join(parts) + " – bitte Speichern")
+                                     if parts else "Nichts gefunden – Details im Protokoll")
+            self.after(0, _done)
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _auto_audio(self):
+        self._auto_detect(audio_only=True)
+
+    def _test_tone(self):
+        """2 s 1000 Hz with PTT using the values shown in the dialog (not yet saved)."""
+        if not messagebox.askyesno("Testton", "Das Funkgerät sendet 2 Sekunden einen 1000-Hz-Ton.\n"
+                                              "Antenne/Dummy Load angeschlossen und Frequenz frei?", parent=self):
+            return
+        values = self._current_values()
+        self.app.cfg.update(values)
+        self.app.link.disconnect()
+        problems = self.app.link.connect()
+        for problem in problems:
+            self.app.log(f"FEHLER: {problem}")
+        self.app._update_connection_label()
+        tone = self.app.audio_gen.generate_sine_wave(1000, 2000, amplitude=0.5)
+        self.app.play_audio_with_ptt(self.app.audio_gen.create_wav_bytes(tone), "Testton 1000 Hz")
 
     def _combo(self, parent, row, label, values, current, editable=False, width=14):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
@@ -343,25 +476,9 @@ class SettingsDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror("Einstellungen", "CI-V Adresse muss hexadezimal sein (z.B. 94).", parent=self)
             return
-        try:
-            delay = max(0, int(float(self.sp_delay.get())))
-        except ValueError:
-            delay = 300
-        radio = self.cb_radio.get()
         cfg = self.app.cfg
+        cfg.update(self._current_values())
         cfg.update({
-            "RADIO_MODEL": "" if radio == "(manuell)" else radio,
-            "PTC_SERIAL_PORT": self.cb_ptc_port.get().strip(),
-            "PTC_BAUD": int(self.cb_ptc_baud.get()),
-            "PTC_MODEM_TYPE": self.cb_ptc_type.get(),
-            "RIG_SERIAL_PORT": self.cb_rig_port.get().strip(),
-            "RIG_BAUD": int(self.cb_rig_baud.get()),
-            "CAT_ADDRESS": civ.upper(),
-            "CAT_PROTOCOL": self.cb_proto.get(),
-            "PTT_METHOD": self.cb_ptt.get(),
-            "PTT_DELAY_MS": delay,
-            "AUDIO_OUT": self.cb_out.get(),
-            "AUDIO_IN": self.cb_in.get(),
             "OUR_ID": our,
             "CODAN_MODE": self.cb_mode.get(),
             "CODAN_SELCALL_CMD": self.e_cmd_sel.get().strip() or DEFAULT_CODAN_SELCALL_CMD,
@@ -579,8 +696,46 @@ class SelCallApp(tk.Tk):
             self.log("Bitte zuerst Einstellungen öffnen: Funkgerät, COM Port, PTT Methode")
             self.open_settings()
             return
+        self._auto_audio_if_missing()
         if self.cfg.get("AUTO_CONNECT", True):
             self.connect()
+
+    def _auto_audio_if_missing(self):
+        """No (or a vanished) sound card set: find the radio's sound card by itself."""
+        if self._codan_uses_cics():
+            return   # Codan sends its own selcall, the PC sound card is not used
+        if audio_device_index(self.cfg.get("AUDIO_OUT", ""), "out") is not None:
+            return
+        outputs, inputs = audio_devices("out"), audio_devices("in")
+
+        def _work():
+            found = {}
+            rig = str(self.cfg.get("RIG_SERIAL_PORT", "") or "")
+            tree = autodetect.windows_device_tree() if rig else []
+            if tree:
+                win_out, win_in = autodetect.audio_for_com_port(rig, tree)
+                found["AUDIO_OUT"] = autodetect.match_name(win_out, outputs)
+                found["AUDIO_IN"] = autodetect.match_name(win_in, inputs)
+            if not found.get("AUDIO_OUT"):
+                found["AUDIO_OUT"] = autodetect.guess_by_name(outputs)
+            if found["AUDIO_OUT"] and not found.get("AUDIO_IN"):
+                found["AUDIO_IN"] = autodetect.pick_partner(inputs, found["AUDIO_OUT"]) or \
+                    autodetect.guess_by_name(inputs)
+
+            def _done():
+                if not found.get("AUDIO_OUT"):
+                    self.log("Keine Funkgeräte-Soundkarte gefunden – Einstellungen → Audio")
+                    return
+                self.cfg["AUDIO_OUT"] = found["AUDIO_OUT"]
+                if found.get("AUDIO_IN"):
+                    self.cfg["AUDIO_IN"] = found["AUDIO_IN"]
+                self.log(f"Soundkarte automatisch gewählt: TX {self.cfg['AUDIO_OUT']} | RX {self.cfg.get('AUDIO_IN')}")
+                try:
+                    save_config(self.cfg)
+                except OSError:
+                    pass
+            self.after(0, _done)
+        threading.Thread(target=_work, daemon=True).start()
 
     def connect(self):
         self.btn_connect.config(state="disabled")
@@ -647,6 +802,12 @@ class SelCallApp(tk.Tk):
             return
         out_name = self.cfg.get("AUDIO_OUT", "")
         out_dev = audio_device_index(out_name, "out")
+        if out_dev is None:
+            guess = autodetect.guess_by_name(audio_devices("out"))
+            if guess:
+                self.log(f"Audio-Ausgang {'fehlt' if not out_name else repr(out_name) + ' nicht gefunden'} – "
+                         f"nehme {guess}")
+                out_name, out_dev = guess, audio_device_index(guess, "out")
         if out_name and out_dev is None:
             self.log(f"WARNUNG: Audio-Ausgang '{out_name}' nicht gefunden – Standardgerät")
         elif not out_name:
