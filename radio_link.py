@@ -433,6 +433,34 @@ class RadioLink:
             return f"CAT-Protokoll {self.cat_protocol} hat keinen PTT-Befehl – RTS oder DTR wählen"
         return ""
 
+    def _icom_ptt(self, active: bool, frame: bytes) -> bool:
+        """CI-V PTT with the radio's answer: FB = done, FA = refused, nothing = no link."""
+        addr = f"{self._civ_address():02X}"
+        ok_hex, ng_hex = f"E0 {addr} FB FD", f"E0 {addr} FA FD"
+        self.rig.clear_recent()
+        if not self.rig.write(frame):
+            self.log("PTT: RIG COM Port nicht offen")
+            return False
+        reply = self.rig.wait_for(lambda t: ok_hex in t or ng_hex in t, 0.6)
+        state = "EIN" if active else "AUS"
+        if reply and ng_hex in reply:
+            self.log(f"PTT {state}: Funkgerät lehnt ab (FA). Häufig: Frequenz außerhalb der Amateurbänder "
+                     f"(IC-7300 sendet z.B. nicht auf Codan-Kanälen wie 4947 kHz), TX gesperrt, oder "
+                     f"Betriebsart ohne Senden.")
+            return False
+        if reply is None:
+            # some set-ups do not answer: ask the TX state (1C 00) instead
+            self.rig.clear_recent()
+            self.rig.write(b"\xFE\xFE" + bytes([self._civ_address(), 0xE0, 0x1C, 0x00]) + b"\xFD")
+            want = f"E0 {addr} 1C 00 0{1 if active else 0} FD"
+            if self.rig.wait_for(lambda t: want in t, 0.6) is None:
+                self.log(f"PTT {state}: KEINE Antwort vom Funkgerät auf CI-V {addr}h – RIG COM Port, "
+                         f"RIG Baudrate (IC-7300: MENU > SET > Connectors > CI-V > CI-V USB Baud Rate) "
+                         f"und CI-V Adresse prüfen, oder '🔍 Automatisch erkennen'.")
+                return not active   # releasing PTT never counts as failed
+        self.log(f"PTT {state} (CAT, Funkgerät bestätigt)")
+        return True
+
     def set_ptt(self, active: bool) -> bool:
         method = self.ptt_method
         try:
@@ -440,7 +468,13 @@ class RadioLink:
                 return True
             if method == "CAT":
                 data = self._cat_ptt_bytes(active)
-                if not data or not self.rig.write(data):
+                if not data:
+                    self.log(f"PTT: Protokoll {self.cat_protocol} hat keinen PTT-Befehl – RTS/DTR wählen")
+                    return False
+                if self.cat_protocol.upper() == "ICOM":
+                    return self._icom_ptt(active, data)
+                if not self.rig.write(data):
+                    self.log("PTT: RIG COM Port nicht offen")
                     return False
             elif method == "RTS":
                 self.rig.set_lines(rts=active)

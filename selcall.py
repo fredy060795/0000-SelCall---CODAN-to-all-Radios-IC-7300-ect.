@@ -246,12 +246,33 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.title("Einstellungen")
-        self.resizable(False, True)
+        self.resizable(True, True)
         self.transient(app)
         cfg = app.cfg
 
-        outer = ttk.Frame(self, padding=8)
-        outer.pack(fill=tk.BOTH, expand=True)
+        # Save / Cancel always visible at the bottom, the rest scrolls
+        bottom = ttk.Frame(self, padding=(8, 6))
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(bottom, text="Speichern", command=self._save).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bottom, text="Abbrechen", command=self.destroy).pack(side=tk.RIGHT)
+        ttk.Separator(self).pack(side=tk.BOTTOM, fill=tk.X)
+
+        holder = ttk.Frame(self)
+        holder.pack(fill=tk.BOTH, expand=True)
+        self._canvas = tk.Canvas(holder, highlightthickness=0, borderwidth=0)
+        bar = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        outer = ttk.Frame(self._canvas, padding=8)
+        self._outer_id = self._canvas.create_window((0, 0), window=outer, anchor=tk.NW)
+        outer.bind("<Configure>", lambda _e: self._canvas.configure(scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfigure(self._outer_id, width=e.width))
+        self.bind("<MouseWheel>", self._on_wheel)                      # Windows / macOS
+        self.bind("<Button-4>", lambda _e: self._canvas.yview_scroll(-3, "units"))   # Linux
+        self.bind("<Button-5>", lambda _e: self._canvas.yview_scroll(3, "units"))
+        height = max(400, min(860, self.winfo_screenheight() - 120))
+        self.geometry(f"640x{height}")
 
         f_auto = ttk.Frame(outer)
         f_auto.pack(fill=tk.X, pady=(0, 4))
@@ -322,6 +343,14 @@ class SettingsDialog(tk.Toplevel):
         f_atest.grid(row=2, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
         ttk.Button(f_atest, text="Nur Soundkarte suchen", command=self._auto_audio).pack(side=tk.LEFT)
         ttk.Button(f_atest, text="🔊 Testton 2 s (mit PTT)", command=self._test_tone).pack(side=tk.LEFT, padx=6)
+        ttk.Button(f_atest, text="PTT-Test 1 s", command=self._test_ptt).pack(side=tk.LEFT)
+        ttk.Button(f_atest, text="Alle Audiogeräte ins Protokoll", command=self._log_audio_devices).pack(
+            side=tk.LEFT, padx=6)
+        if sd is None:
+            ttk.Label(f_audio, foreground="red", text=(
+                "Modul 'sounddevice' fehlt – darum sind die Listen leer.\n"
+                "Installieren:  py -m pip install sounddevice  (dann Programm neu starten)")).grid(
+                row=4, column=0, columnspan=3, sticky=tk.W)
         ttk.Label(f_audio, foreground="gray", justify=tk.LEFT, text=(
             "Testton: das Funkgerät muss senden und die ALC/Leistung ausschlagen.\n"
             "Richtiger Eingang: RX Decoder starten – der Pegel zeigt das Rauschen des Empfängers.")).grid(
@@ -357,11 +386,13 @@ class SettingsDialog(tk.Toplevel):
         self.v_auto = tk.BooleanVar(value=bool(cfg.get("AUTO_CONNECT", True)))
         ttk.Checkbutton(outer, text="Beim Start automatisch verbinden", variable=self.v_auto).pack(anchor=tk.W)
 
-        buttons = ttk.Frame(outer)
-        buttons.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(buttons, text="Speichern", command=self._save).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(buttons, text="Abbrechen", command=self.destroy).pack(side=tk.RIGHT)
         self._show_profile()
+
+    def _on_wheel(self, event):
+        # an open combobox list scrolls itself
+        if str(event.widget).endswith("popdown.f.l"):
+            return
+        self._canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
 
     def _current_values(self) -> dict:
         try:
@@ -452,6 +483,38 @@ class SettingsDialog(tk.Toplevel):
         tone = self.app.audio_gen.generate_sine_wave(1000, 2000, amplitude=0.5)
         self.app.play_audio_with_ptt(self.app.audio_gen.create_wav_bytes(tone), "Testton 1000 Hz")
 
+    def _log_audio_devices(self):
+        log = self.app.log
+        if sd is None:
+            log("Audio: Modul 'sounddevice' fehlt – py -m pip install sounddevice")
+            return
+        try:
+            apis = sd.query_hostapis()
+            for i, dev in enumerate(sd.query_devices()):
+                api = apis[dev["hostapi"]]["name"] if dev["hostapi"] < len(apis) else "?"
+                log(f"Audio {i:2d} [{api}] in={dev['max_input_channels']} out={dev['max_output_channels']} "
+                    f"{dev['name']}")
+        except Exception as exc:
+            log(f"Audio: Geräte nicht lesbar: {exc}")
+        log(f"Auswahlliste Ausgang: {audio_devices('out')}")
+        log(f"Erkannt als Funkgerät: {autodetect.guess_by_name(audio_devices('out'))}")
+
+    def _test_ptt(self):
+        if not messagebox.askyesno("PTT-Test", "Das Funkgerät geht 1 Sekunde auf Senden (ohne Ton).\n"
+                                               "Antenne/Dummy Load angeschlossen?", parent=self):
+            return
+        self.app.cfg.update(self._current_values())
+        self.app.link.disconnect()
+        for problem in self.app.link.connect():
+            self.app.log(f"FEHLER: {problem}")
+        self.app._update_connection_label()
+
+        def _work():
+            if self.app.link.set_ptt(True):
+                time.sleep(1.0)
+            self.app.link.set_ptt(False)
+        threading.Thread(target=_work, daemon=True).start()
+
     def _combo(self, parent, row, label, values, current, editable=False, width=14):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky=tk.W, pady=2)
         combo = ttk.Combobox(parent, values=values, width=width, state="normal" if editable else "readonly")
@@ -519,7 +582,7 @@ class SelCallApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SelCall Terminal")
-        self.geometry("640x760")
+        self.geometry(f"660x{max(520, min(800, self.winfo_screenheight() - 80))}")
         self.cfg = load_config()
         self.profiles = radio_models.load_models(APP_DIR)
         self.audio_gen = AudioGenerator()

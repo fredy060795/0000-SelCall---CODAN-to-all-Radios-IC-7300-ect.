@@ -167,6 +167,7 @@ def _inner(name: str) -> str:
 def guess_by_name(names: List[str]) -> Optional[str]:
     """Best radio-looking sound card by name, None if nothing fits."""
     best, best_rank = None, 99
+    usb_only = []
     for name in names:
         up = _norm(name)
         if any(bad in up for bad in PC_AUDIO_NAMES):
@@ -174,6 +175,10 @@ def guess_by_name(names: List[str]) -> Optional[str]:
         for rank, word in enumerate(RADIO_AUDIO_NAMES):
             if word in up and rank < best_rank:
                 best, best_rank = name, rank
+        if "USB" in up or "CODEC" in up or re.search(r"\bIC-|\bFT-|\bTS-", up):
+            usb_only.append(name)
+    if best is None and len(usb_only) == 1:
+        best = usb_only[0]       # the only USB sound card on the PC
     return best
 
 

@@ -150,17 +150,34 @@ class RadioLinkTest(unittest.TestCase):
         self.assertIn("ERROR", link.send_codan_cics("beacon 435201"))
         link.disconnect()
 
-    def test_icom_cat_ptt(self):
-        dev = FakeDevice(lambda line: None)
+    def _icom(self, answer):
+        dev = FakeDevice(None, raw=answer)
         link = self.make_link({"RADIO_MODEL": "IC-7300", "PTT_METHOD": "CAT", "CAT_ADDRESS": "94",
                                "RIG_SERIAL_PORT": dev.port, "RIG_BAUD": 115200})
         self.assertEqual(link.connect(), [])
+        return dev, link
+
+    def test_icom_cat_ptt_confirmed(self):
+        dev, link = self._icom(lambda d: b"\xfe\xfe\xe0\x94\xfb\xfd" if b"\x1c\x00" in d else None)
         self.assertEqual(link.can_key_audio(), "")
         self.assertTrue(link.set_ptt(True))
         self.assertTrue(link.set_ptt(False))
-        time.sleep(0.2)
         self.assertIn(b"\xfe\xfe\x94\xe0\x1c\x00\x01\xfd", dev.received)
         self.assertIn(b"\xfe\xfe\x94\xe0\x1c\x00\x00\xfd", dev.received)
+        self.assertTrue(any("bestätigt" in line for line in self.logs))
+        link.disconnect()
+
+    def test_icom_refuses_tx(self):
+        dev, link = self._icom(lambda d: b"\xfe\xfe\xe0\x94\xfa\xfd")
+        self.assertFalse(link.set_ptt(True))
+        self.assertTrue(any("Amateurbänder" in line for line in self.logs))
+        link.disconnect()
+
+    def test_icom_silent(self):
+        dev, link = self._icom(lambda d: None)
+        self.assertFalse(link.set_ptt(True))
+        self.assertTrue(link.set_ptt(False))
+        self.assertTrue(any("KEINE Antwort" in line for line in self.logs))
         link.disconnect()
 
     def test_tnc_without_codan_cannot_key_audio(self):
@@ -213,6 +230,11 @@ class AudioMatchTest(unittest.TestCase):
         self.assertEqual(autodetect.pick_partner(INPUTS, "Lautsprecher (USB Audio CODEC)"),
                          "Mikrofon (USB Audio CODEC)")
         self.assertIsNone(autodetect.guess_by_name(["Lautsprecher (Realtek(R) Audio)"]))
+        # unknown interface name, but the only USB sound card
+        self.assertEqual(autodetect.guess_by_name(["Lautsprecher (Realtek(R) Audio)", "Speakers (2- USB Sound Card)",
+                                                   "Lautsprecher (USB Interface XY)"]), "Speakers (2- USB Sound Card)")
+        self.assertEqual(autodetect.guess_by_name(["Lautsprecher (Realtek(R) Audio)", "Lautsprecher (USB Interface XY)"]),
+                         "Lautsprecher (USB Interface XY)")
 
 
 @unittest.skipIf(pty is None, "needs pty + pyserial")
