@@ -271,9 +271,15 @@ class RadioLink:
 
     @property
     def is_codan(self) -> bool:
-        profile = self.profile
-        if profile is not None:
-            return bool(profile.is_codan)
+        """True only when the radio this program talks to speaks Codan CICS.
+
+        Direct on the PC (CAT/RTS/DTR) that is decided by the CAT protocol: an
+        Icom on the RIG port never gets CICS text, whatever radio model is
+        chosen.  Through the modem (TNC) the radio model decides.
+        """
+        if self.ptt_method == "TNC":
+            profile = self.profile
+            return bool(profile.is_codan) if profile is not None else self.cat_protocol == "CODAN"
         return self.cat_protocol == "CODAN"
 
     def connect(self) -> list:
@@ -305,6 +311,7 @@ class RadioLink:
         return problems
 
     def disconnect(self):
+        self.usb_data_set = False
         self.rig.close()
         self.ptc.close()
         self._modem_trx_setup_for = ""
@@ -386,6 +393,9 @@ class RadioLink:
             return ""
         if not self.rig.is_open:
             return "RIG COM Port (Codan CICS) ist nicht verbunden"
+        if self.cat_protocol != "CODAN":
+            return (f"Am RIG Port ist ein {self.cat_protocol}-Funkgerät eingestellt, kein Codan – "
+                    f"CICS-Befehle gehen nur an einen Codan")
         self.rig.clear_recent()
         self.remember_sent(command)
         self.rig.write((command + "\r").encode("ascii", errors="ignore"))
@@ -393,6 +403,8 @@ class RadioLink:
         reply = self.rig.wait_for(lambda t: "ERROR" in t.upper() or "OK" in t.upper(), 2.0)
         if reply and "ERROR" in reply.upper():
             return f"Codan meldet: {reply}"
+        if reply is None and not self.rig.wait_for(lambda t: True, 0.1):
+            self.log("WARNUNG: keine Antwort vom Codan – CICS eingeschaltet? Baudrate richtig?")
         return ""
 
     # ------------------------------------------------------------------ PTT
@@ -473,9 +485,10 @@ class RadioLink:
         for payload in (b"\x06\x01\x01", b"\x1A\x06\x01\x01"):      # mode USB, data mode on (FIL1)
             self.rig.clear_recent()
             self.rig.write(b"\xFE\xFE" + bytes([addr, 0xE0]) + payload + b"\xFD")
-            reply = self.rig.wait_for(lambda t: f"E0 {addr:02X} FB FD" in t or f"E0 {addr:02X} FA FD" in t, 0.6)
+            reply = self.rig.wait_for(lambda t: f"E0 {addr:02X} FB FD" in t or f"E0 {addr:02X} FA FD" in t, 1.5)
             replies.append("OK" if reply and "FB" in reply else ("abgelehnt" if reply else "keine Antwort"))
         self.log(f"Funkgerät auf USB-D: Mode USB {replies[0]}, DATA {replies[1]}")
+        self.usb_data_set = replies[1] == "OK"
         return "" if replies == ["OK", "OK"] else f"Mode USB {replies[0]}, DATA {replies[1]}"
 
     def _icom_ptt(self, active: bool, frame: bytes) -> bool:
