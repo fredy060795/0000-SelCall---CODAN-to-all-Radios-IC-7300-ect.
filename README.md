@@ -121,8 +121,8 @@ TYPISCHE AUFBAUTEN
      PTT Methode = CAT, Audio Ausgang = "USB Audio CODEC"
    Am IC-7300:
      - Betriebsart USB-D (DATA-Taste)
-     - DATA MOD: stellt SelCall selbst kurz auf USB (siehe unten),
-       am Gerät auf ACC lassen, wenn ein PACTOR-Modem an ACC hängt
+     - DATA OFF MOD = MIC,USB (DATA MOD bleibt z.B. ACC für PACTOR),
+       siehe unten
      - USB MOD Level ca. 50 % (ALC kaum Ausschlag), 10-30 W
      - CI-V Address 94h, CI-V USB Baud Rate 115200 (oder Auto)
 
@@ -173,17 +173,19 @@ am Funkgerät ankommt.
   (sonst gibt es den "USB Audio CODEC" nicht). Treiber: Icom USB Driver.
 - "Alle Audiogeräte ins Protokoll" drücken und die Liste schicken.
 
-IC-7300 MIT PACTOR-MODEM AN ACC (DATA MOD)
-------------------------------------------
-DATA MOD am IC-7300 kann nur EINE Quelle haben: ACC (PACTOR-Modem) oder USB
-(SelCall vom PC). Darum: am Funkgerät DATA MOD auf ACC lassen.
-SelCall stellt vor jedem Ruf über CI-V um (Menü 1A 05 00 67):
-  DATA MOD → USB, Betriebsart → USB-D
-und danach wieder zurück auf genau das, was vorher eingestellt war
-(z.B. ACC, USB, DATA aus). Im Protokoll steht "DATA MOD ACC → USB (nur für
-diesen Ruf)" und "DATA MOD zurück auf ACC".
-Abschaltbar in Einstellungen → CAT / RIG. IC-7300MK2: Menü-Nr. 0085.
-Kann DATA MOD nicht gelesen werden, fasst das Programm das Menü nicht an.
+IC-7300 MIT PACTOR-MODEM AN ACC
+-------------------------------
+Der IC-7300 hat ZWEI Ton-Einstellungen:
+  DATA MOD      gilt für USB-D  -> ACC lassen (PACTOR-Modem)
+  DATA OFF MOD  gilt für USB    -> einmalig auf MIC,USB stellen
+MENU > SET > Connectors > MOD Input > DATA OFF MOD = MIC,USB
+Dann sendet SelCall in normalem USB mit dem Ton vom PC, PACTOR läuft wie
+bisher in USB-D über ACC, und das Mikrofon geht in USB weiter.
+SelCall liest beide Einstellungen nur aus (ändert das Menü NIE), stellt
+für den Ruf USB bzw. USB-D ein und danach die vorherige Betriebsart wieder
+her. Nimmt keine der beiden Betriebsarten den Ton vom PC, wird nicht
+gesendet und die nötige Einstellung angezeigt.
+Einstellungen → CAT / RIG → "Icom Selcall in": AUTO / USB / USB-D.
 
 CODAN SELCALL VOM PC (Audio, CCIR 493-4)
 ----------------------------------------
