@@ -44,7 +44,8 @@ CODAN SELCALL (CCIR 493-4):
 ---------------------------
 - Echtes CODAN-Format: 100 Baud FSK, 1700 Hz (0) / 1870 Hz (1),
   Punktmuster-Vorspann, Phasing, jedes Zeichen doppelt (DX/RX).
-- Call ID und Our ID muessen GENAU 4 Ziffern haben (z.B. 1234).
+- Call ID und Our ID: 4 oder 6 Ziffern (z.B. 1234 oder 435299),
+  beide gleich lang. 6-stellig = 3 Ziffernpaare (43 52 99).
 - Vorspann ("Preamble"): 2 s wenn die Gegenstation auf dem Kanal steht,
   6-12 s wenn die Gegenstation scannt.
 - "Channel Test": CODAN-Geraete antworten mit einer Tonfolge.

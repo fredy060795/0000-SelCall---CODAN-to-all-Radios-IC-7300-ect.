@@ -295,7 +295,7 @@ class AudioGenerator:
 
 
 class CodanSelcallEncoder:
-    """CODAN HF selcall = CCIR 493-4 (4-digit addresses).
+    """CODAN HF selcall = CCIR 493-4 (4-digit) / open 6-digit selcall.
 
     100 baud phase-continuous 2-FSK, 1700 Hz = bit 0, 1870 Hz = bit 1
     (audio frequencies in USB). Each word = 7 information bits (LSB first)
@@ -330,31 +330,29 @@ class CodanSelcallEncoder:
 
     @staticmethod
     def split_id(station_id, label):
-        sid = str(station_id).strip()
-        if not (sid.isdigit() and len(sid) == 4):
+        """4 digits -> 2 symbols, 6 digits -> 3 symbols (each symbol = digit pair 00-99)."""
+        sid = str(station_id).strip().replace(" ", "")
+        if not (sid.isdigit() and len(sid) in (4, 6)):
             raise ValueError(
-                f"{label} '{sid}' is invalid: CODAN / CCIR 493-4 selcall uses exactly 4 digits (0000-9999)."
+                f"{label} '{sid}' is invalid: CODAN / CCIR 493-4 selcall uses 4 or 6 digits "
+                f"(e.g. 1234 or 435299)."
             )
-        return int(sid[:2]), int(sid[2:])
+        return [int(sid[i:i + 2]) for i in range(0, len(sid), 2)]
 
     def build_words(self, call_id, our_id, fmt=FMT_SELCALL, category=100):
-        b1, b2 = self.split_id(call_id, "Call ID")
-        a1, a2 = self.split_id(our_id, "Our ID")
+        to = self.split_id(call_id, "Call ID")
+        frm = self.split_id(our_id, "Our ID")
+        if len(to) != len(frm):
+            raise ValueError("Call ID and Our ID must both have 4 digits or both have 6 digits.")
+        # Message in DX order: format, called address, category, self ID, EOS x3
+        dx = [fmt] + to + [category] + frm + [self.EOS_ARQ] * 3
+        # RX copy lags the DX copy by 4 words (time diversity)
+        rx = [dx[0], dx[0]] + dx[:-2]
         words = []
-        for rx in self.PHASING_RX:
-            words += [self.PHASING_DX, rx]
-        # DX/RX interleaved, RX copy lags DX copy by 4 words
-        words += [
-            fmt, fmt,
-            b1, fmt,
-            b2, fmt,
-            category, b1,
-            a1, b2,
-            a2, category,
-            self.EOS_ARQ, a1,
-            self.EOS_ARQ, a2,
-            self.EOS_ARQ, self.EOS_ARQ,
-        ]
+        for ph in self.PHASING_RX:
+            words += [self.PHASING_DX, ph]
+        for d, r in zip(dx, rx):
+            words += [d, r]
         return words
 
     def build_bits(self, call_id, our_id, fmt=FMT_SELCALL, category=100, preamble_s=2.0):
@@ -1081,12 +1079,12 @@ class SelCallApp(tk.Tk):
         form_frame = ttk.Frame(self.tab_codan, padding=10)
         form_frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(form_frame, text="Call ID (4 digits):").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Label(form_frame, text="Call ID (4/6 digits):").grid(row=0, column=0, sticky=tk.W, pady=5)
         self.codan_call_id = ttk.Entry(form_frame, width=15)
         self.codan_call_id.insert(0, "1234")
         self.codan_call_id.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
 
-        ttk.Label(form_frame, text="Our ID (4 digits):").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(form_frame, text="Our ID (4/6 digits):").grid(row=1, column=0, sticky=tk.W, pady=5)
         self.codan_our_id = ttk.Entry(form_frame, width=15)
         self.codan_our_id.insert(0, str(self.selected_our_id))
         self.codan_our_id.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
