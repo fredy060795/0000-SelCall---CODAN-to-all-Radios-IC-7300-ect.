@@ -125,6 +125,36 @@ TYPISCHE AUFBAUTEN
      - USB MOD Level ca. 50 % (ALC kaum Ausschlag), 10-30 W
      - CI-V Address 94h, CI-V USB Baud Rate 115200 (oder Auto)
 
+WARUM GEHT DER TON NICHT ÜBER DEN COM PORT?
+-------------------------------------------
+Der COM Port ist eine reine Daten-/Befehlsleitung (CAT/CI-V: Frequenz,
+PTT, ...). Ton kann darüber nicht übertragen werden. Beim IC-7300 läuft
+der Ton über die eingebaute USB-Soundkarte ("USB Audio CODEC") - im
+selben USB-Kabel, aber als eigenes Gerät. Deshalb braucht der Audio-Weg
+COM Port (PTT) UND Soundkarte (Ton).
+Ausnahme Codan: Der Codan erzeugt den Selcall selbst, das Programm
+schickt nur den Befehl über den COM Port - keine Soundkarte nötig.
+
+WENN DIE PTT NICHT AUF SENDEN GEHT (IC-7300, PTT Methode CAT)
+------------------------------------------------------------
+"PTT-Test 1 s" in den Einstellungen drücken und ins Protokoll schauen:
+  "Funkgerät bestätigt"  -> PTT geht, Problem liegt beim Ton
+  "lehnt ab (FA)"        -> das Funkgerät verweigert das Senden. Der
+                            IC-7300 sendet NUR in den Amateurbändern -
+                            auf Codan-Kanälen (z.B. 4947 kHz) geht er
+                            nicht auf TX.
+  "KEINE Antwort"        -> falscher COM Port / falsche Baudrate /
+                            falsche CI-V Adresse: "Automatisch erkennen".
+                            IC-7300: MENU > SET > Connectors > CI-V >
+                            CI-V USB Baud Rate = 115200, CI-V Address = 94h.
+
+SOUNDKARTE WIRD NICHT ERKANNT
+-----------------------------
+- Ist die Liste leer: "py -m pip install sounddevice" fehlt.
+- IC-7300 per USB anschließen und EINSCHALTEN, bevor das Programm startet
+  (sonst gibt es den "USB Audio CODEC" nicht). Treiber: Icom USB Driver.
+- "Alle Audiogeräte ins Protokoll" drücken und die Liste schicken.
+
 CODAN SELCALL VOM PC (Audio, CCIR 493-4)
 ----------------------------------------
 - Call ID und eigene ID: 4 oder 6 Ziffern, beide gleich lang.
